@@ -15,7 +15,9 @@ export const DEFAULT_STATE = {
   sel: '',
   cluster: false,
   areas: false,
-  imported: true
+  imported: true,
+  basemap: 'auto',
+  linkColor: '#c678dd'
 };
 
 const num = (v, d) => {
@@ -40,7 +42,9 @@ export function readState() {
     sel: p.get('sel') ?? '',
     cluster: p.get('cluster') === '1', // clustering off by default
     areas: p.get('areas') === '1',
-    imported: p.get('imported') !== '0' // imported nodes shown by default
+    imported: p.get('imported') !== '0', // imported nodes shown by default
+    basemap: p.get('basemap') || DEFAULT_STATE.basemap,
+    linkColor: p.get('linkColor') || DEFAULT_STATE.linkColor
   };
 }
 
@@ -58,15 +62,27 @@ export function toQuery(s) {
   if (s.cluster === true) p.set('cluster', '1');
   if (s.areas) p.set('areas', '1');
   if (s.imported === false) p.set('imported', '0');
+  if (s.basemap && s.basemap !== DEFAULT_STATE.basemap) p.set('basemap', s.basemap);
+  if (s.linkColor && s.linkColor !== DEFAULT_STATE.linkColor) p.set('linkColor', s.linkColor);
   return p.toString();
 }
 
+import { replaceState } from '$app/navigation';
+
 let writeTimer;
-/** Debounced history.replaceState so rapid pans/zooms coalesce into one entry. */
+/**
+ * Debounced URL sync so rapid pans/zooms coalesce into one history entry. Uses
+ * SvelteKit's replaceState (not the raw history API) so it doesn't fight the
+ * router; guarded for SSR and for calls before the router is initialized.
+ */
 export function writeState(s, delay = 250) {
   if (typeof history === 'undefined') return;
   clearTimeout(writeTimer);
   writeTimer = setTimeout(() => {
-    history.replaceState(history.state, '', `?${toQuery(s)}`);
+    try {
+      replaceState(`?${toQuery(s)}`, history.state ?? {});
+    } catch {
+      // Router not ready yet (very early call); the next write will catch up.
+    }
   }, delay);
 }

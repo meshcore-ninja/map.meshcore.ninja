@@ -85,6 +85,31 @@ export function viewportNodes(bbox, signal) {
   });
 }
 
+/**
+ * Observed links for one node, as already-aggregated link records. Only links
+ * with this node as an endpoint are returned — never the global topology. The
+ * caller passes an AbortSignal so selecting another node cancels this request.
+ * @param {string} pubkey selected node's public key (hex)
+ * @param {object} [opts]
+ * @param {string} [opts.net] restrict to links observed through this network
+ * @param {string} [opts.active] one of 24h|7d|30d (omit/`all` = no recency filter)
+ * @param {number} [opts.limit]
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<{node:string,links:any[],returned:number,total:number,capped:boolean}>}
+ */
+export function nodeLinks(pubkey, { net, active, limit } = {}, signal) {
+  const sp = new URLSearchParams();
+  if (net) sp.set('networks', net);
+  if (active && active !== 'all') sp.set('active', active);
+  if (limit) sp.set('limit', String(limit));
+  const qs = sp.toString();
+  const url = `${API_BASE}/api/nodes/${encodeURIComponent(pubkey)}/links${qs ? `?${qs}` : ''}`;
+  return fetch(url, { signal }).then((r) => {
+    if (!r.ok) throw new Error(`links api ${r.status}`);
+    return r.json();
+  });
+}
+
 // Network coverage polygons come from the main catalog's prebuilt combined file
 // (one request, tagged per network). Overridable for local testing.
 const AREAS_ORIGIN = (import.meta.env?.VITE_AREAS_ORIGIN || 'https://meshcore.ninja').replace(
