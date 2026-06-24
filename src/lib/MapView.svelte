@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import maplibregl from 'maplibre-gl';
   import 'maplibre-gl/dist/maplibre-gl.css';
-  import { allNodes, networkAreas } from '$lib/api.js';
+  import { allNodes, viewportNodes, networkAreas } from '$lib/api.js';
   import { makeNodePredicate, TYPE_COLOR, DEFAULT_COLOR } from '$lib/filters.js';
 
   let {
@@ -10,6 +10,7 @@
     theme = 'dark',
     filters, // { types:number[], net, active, q }
     clustering = true,
+    showImported = true,
     showAreas = false,
     selected = '',
     onselect = () => {},
@@ -25,6 +26,7 @@
   // toggles never refetch.
   let rawFeatures = []; // all node features (GeoJSON)
   let byPubkey = new Map(); // pubkey -> clean properties (arrays intact)
+  let fullLoaded = false; // true once the whole-world set has replaced the viewport subset
   let areasData = null; // network-area FeatureCollection (lazy)
   let lastQ = '';
   let focusSel = '';
@@ -145,8 +147,13 @@
       type: 'circle',
       source: 'nodes',
       filter: ['!', ['has', 'point_count']],
+      layout: {
+        // Draw our (live) nodes above the imported ones (higher sort key = on top).
+        'circle-sort-key': ['case', ['==', ['get', 'imported'], true], 0, 1]
+      },
       paint: {
-        'circle-color': typeColorExpr,
+        // Externally-mirrored (map.meshcore.io) nodes render grey; live nodes by type.
+        'circle-color': ['case', ['==', ['get', 'imported'], true], DEFAULT_COLOR, typeColorExpr],
         'circle-radius': ['interpolate', ['linear'], ['zoom'], 4, 3.5, 12, 7],
         'circle-stroke-color': '#0d1117',
         'circle-stroke-width': 1
@@ -169,11 +176,19 @@
     applyFilter(true);
   }
 
+  // Swap in a node set (viewport subset first, then the whole world) and render
+  // it if the map is ready.
+  function setFeatures(features) {
+    rawFeatures = features;
+    byPubkey = new Map(features.map((f) => [f.properties.pubkey, f.properties]));
+    if (ready) applyFilter(true);
+  }
+
   // Filter the in-memory node set and push it to the source. No network I/O.
   function applyFilter(force = false) {
     (globalThis.__mlog ??= []).push('applyFilter');
     if (!ready || !map.getSource('nodes')) return;
-    const keep = makeNodePredicate(filters);
+    const keep = makeNodePredicate({ ...filters, imported: showImported });
     const features = rawFeatures.filter((f) => keep(f.properties));
     map.getSource('nodes').setData({ type: 'FeatureCollection', features });
     onstatus({ loading: false, total: rawFeatures.length, shown: features.length });
@@ -250,21 +265,31 @@
       onmove({ z: map.getZoom(), lat: c.lat, lon: c.lng });
     });
 
-    // Fetch the full node set in parallel with the style load.
+    onstatus({ loading: true });
+
+    // Progressive load: paint the current viewport first (fast), then replace it
+    // with the whole-world set as soon as it arrives. A late viewport response
+    // never clobbers the full set (fullLoaded guard).
+    const b = map.getBounds();
+    viewportNodes([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()])
+      .then((fc) => {
+        if (!fullLoaded) setFeatures(fc.features ?? []);
+      })
+      .catch(() => {});
+
     const dataReady = allNodes()
       .then((fc) => {
-        rawFeatures = fc.features ?? [];
-        byPubkey = new Map(rawFeatures.map((f) => [f.properties.pubkey, f.properties]));
+        fullLoaded = true;
+        setFeatures(fc.features ?? []);
       })
       .catch(() => onstatus({ loading: false, error: true }));
 
-    onstatus({ loading: true });
     map.on('load', async () => {
       addAll();
       wireInteractions();
       ready = true;
+      applyFilter(true); // render whatever (viewport) data has arrived so far
       await dataReady;
-      applyFilter(true);
       flyToSelected();
     });
   });
@@ -272,7 +297,7 @@
   onDestroy(() => map?.remove());
 
   // --- reactive effects ------------------------------------------------------
-  let filterKey = $derived(JSON.stringify([filters.types, filters.net, filters.active, filters.q]));
+  let filterKey = $derived(JSON.stringify([filters.types, filters.net, filters.active, filters.q, showImported]));
   $effect(() => {
     filterKey;
     if (ready) applyFilter();

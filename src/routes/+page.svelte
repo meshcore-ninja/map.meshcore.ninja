@@ -28,6 +28,7 @@
   let selectedNode = $state(null);
   let clustering = $state(initial.cluster);
   let showAreas = $state(initial.areas);
+  let showImported = $state(initial.imported);
   let status = $state({ loading: true });
   let networkList = $state([]);
   let panelOpen = $state(false);
@@ -74,7 +75,8 @@
       q: filters.q,
       sel: selected,
       cluster: clustering,
-      areas: showAreas
+      areas: showAreas,
+      imported: showImported
     });
   });
 
@@ -97,6 +99,7 @@
   {theme}
   {filters}
   {clustering}
+  {showImported}
   {showAreas}
   {selected}
   onselect={onSelect}
@@ -257,7 +260,7 @@
   <div>
     <div class="mb-1.5 text-[0.7rem] font-semibold uppercase tracking-wide text-dim">Display</div>
     <div class="flex flex-col gap-1">
-      {#each [{ label: 'Cluster nearby nodes', get: () => clustering, set: (v) => (clustering = v) }, { label: 'Network coverage areas', get: () => showAreas, set: (v) => (showAreas = v) }] as row}
+      {#each [{ label: 'Cluster nearby nodes', get: () => clustering, set: (v) => (clustering = v) }, { label: 'Imported nodes (meshcore.io)', get: () => showImported, set: (v) => (showImported = v) }, { label: 'Network coverage areas', get: () => showAreas, set: (v) => (showAreas = v) }] as row}
         <button
           onclick={() => row.set(!row.get())}
           class="flex items-center justify-between rounded-lg px-1 py-1.5 text-[0.85rem] text-ink hover:bg-elev2"

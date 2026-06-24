@@ -37,13 +37,14 @@ export function activitySince(active) {
  * Client-side node filter. Applied to the full node set in the browser so
  * changing filters never re-hits the API. Properties come straight off the
  * GeoJSON feature.
- * @param {object} filters { types:number[], net, active, q }
+ * @param {object} filters { types:number[], net, active, q, imported }
  */
-export function makeNodePredicate({ types, net, active, q }) {
+export function makeNodePredicate({ types, net, active, q, imported = true }) {
   const typeSet = types?.length ? new Set(types) : null;
   const since = activitySince(active);
   const query = (q ?? '').toLowerCase();
   return (p) => {
+    if (!imported && p.imported) return false;
     if (typeSet && !typeSet.has(p.type)) return false;
     if (since && (p.lastAdvertAt ?? 0) < since) return false;
     if (net) {

@@ -13,8 +13,9 @@ export const DEFAULT_STATE = {
   active: 'all',
   q: '',
   sel: '',
-  cluster: true,
-  areas: false
+  cluster: false,
+  areas: false,
+  imported: true
 };
 
 const num = (v, d) => {
@@ -37,8 +38,9 @@ export function readState() {
     active: p.get('active') ?? DEFAULT_STATE.active,
     q: p.get('q') ?? '',
     sel: p.get('sel') ?? '',
-    cluster: p.get('cluster') !== '0', // clustering on by default
-    areas: p.get('areas') === '1'
+    cluster: p.get('cluster') === '1', // clustering off by default
+    areas: p.get('areas') === '1',
+    imported: p.get('imported') !== '0' // imported nodes shown by default
   };
 }
 
@@ -53,8 +55,9 @@ export function toQuery(s) {
   if (s.active && s.active !== 'all') p.set('active', s.active);
   if (s.q) p.set('q', s.q);
   if (s.sel) p.set('sel', s.sel);
-  if (s.cluster === false) p.set('cluster', '0');
+  if (s.cluster === true) p.set('cluster', '1');
   if (s.areas) p.set('areas', '1');
+  if (s.imported === false) p.set('imported', '0');
   return p.toString();
 }
 

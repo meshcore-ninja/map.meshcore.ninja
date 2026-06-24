@@ -69,6 +69,22 @@ export function allNodes() {
   return allNodesPromise;
 }
 
+/**
+ * Individual nodes within a bounding box, as a GeoJSON FeatureCollection. Used
+ * for the first paint: the current viewport loads fast, then {@link allNodes}
+ * backfills the rest of the world. Not memoized (the bbox varies).
+ * @param {[number,number,number,number]} bbox west,south,east,north
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<{type:string,features:any[]}>}
+ */
+export function viewportNodes(bbox, signal) {
+  const qs = `all=1&bbox=${bbox.map((n) => n.toFixed(4)).join(',')}`;
+  return fetch(`${API_BASE}/api/map?${qs}`, { signal }).then((r) => {
+    if (!r.ok) throw new Error(`map api ${r.status}`);
+    return r.json();
+  });
+}
+
 // Network coverage polygons come from the main catalog's prebuilt combined file
 // (one request, tagged per network). Overridable for local testing.
 const AREAS_ORIGIN = (import.meta.env?.VITE_AREAS_ORIGIN || 'https://meshcore.ninja').replace(
