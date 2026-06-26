@@ -107,14 +107,16 @@
   // (so panning across nodes doesn't fire a request each one) and aborted on
   // change so a fast move never lands a stale path.
   let hoveredPk = $state('');
+  let hoveredNode = $state(null); // hovered node's metadata (for the panel header)
   let route = $state(null);
   let routeLoading = $state(false);
   let routeError = $state(false);
-  let routeTarget = $state(null); // metadata of the destination node, for the panel header
   let routeCtl; // AbortController for the in-flight request
   let routeTimer;
   const ROUTE_DWELL_MS = 280;
 
+  // Tracks only the inputs (selection, hover target, filters) — never `route` or
+  // the loading flags it sets — so resolving a route can't re-trigger the effect.
   $effect(() => {
     const from = selected;
     const to = hoveredPk;
@@ -125,12 +127,10 @@
     // Routing only makes sense from one node to a different one.
     if (!from || !to || from === to) {
       route = null;
-      routeTarget = null;
       routeLoading = false;
       routeError = false;
       return;
     }
-    routeTarget = nodeByPubkey(to);
     routeLoading = true;
     routeError = false;
     routeTimer = setTimeout(() => {
@@ -148,14 +148,6 @@
         });
     }, ROUTE_DWELL_MS);
   });
-
-  // A route's endpoint names come from the route response, but the hovered-node
-  // header is nicer with whatever metadata the map already knows. MapView owns the
-  // node table, so fall back to the route payload's endpoint when it arrives.
-  function nodeByPubkey(pk) {
-    const n = route?.nodes?.find?.((x) => x.pubkey === pk);
-    return n ?? { pubkey: pk };
-  }
 
   // Focus a neighbor from the link list: select it (which refetches its links).
   function selectNeighbor(l) {
@@ -260,10 +252,11 @@
     }
     return { hops: hops.length, weakest, oldest };
   });
-  // The destination's display name, preferring the richer map metadata when known.
+  // The destination's display name: the hovered node's own name while routing,
+  // falling back to the route payload's endpoint once it resolves.
   let routeToName = $derived(
-    (route?.found && route.nodes?.length ? route.nodes[route.nodes.length - 1]?.name : '') ||
-      routeTarget?.name ||
+    hoveredNode?.name ||
+      (route?.found && route.nodes?.length ? route.nodes[route.nodes.length - 1]?.name : '') ||
       'this node'
   );
 </script>
@@ -285,7 +278,10 @@
   {hoveredNeighbor}
   {route}
   onselect={onSelect}
-  onhover={(pk) => (hoveredPk = pk)}
+  onhover={(pk, node) => {
+    hoveredPk = pk;
+    hoveredNode = node;
+  }}
   onmove={(v) => (view = v)}
   onstatus={(s) => (status = s)}
   onready={() => (appReady = true)}

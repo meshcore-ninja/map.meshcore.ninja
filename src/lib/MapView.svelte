@@ -406,7 +406,7 @@
   function onHoverNode(pk) {
     if (pk === hoverPk) return;
     hoverPk = pk;
-    onhover(pk); // let the parent compute a route from the selected node to here
+    onhover(pk, pk ? byPubkey.get(pk) ?? null : null); // parent routes selected → here
     scheduleHoverPreview(pk);
   }
 
