@@ -19,7 +19,7 @@ export const DEFAULT_STATE = {
   globe: false,
   basemap: 'auto',
   linkColor: '#c678dd',
-  live: true, // real-time advert pulses, on by default
+  live: false, // real-time advert pulses, opt-in
   route: false // best-effort route resolving, off by default (Advanced)
 };
 
@@ -49,7 +49,7 @@ export function readState() {
     globe: p.get('globe') === '1', // flat mercator by default
     basemap: p.get('basemap') || DEFAULT_STATE.basemap,
     linkColor: p.get('linkColor') || DEFAULT_STATE.linkColor,
-    live: p.get('live') !== '0', // live pulses on by default
+    live: p.get('live') === '1', // live pulses opt-in
     route: p.get('route') === '1' // route resolving off by default
   };
 }
@@ -71,7 +71,7 @@ export function toQuery(s) {
   if (s.globe === true) p.set('globe', '1');
   if (s.basemap && s.basemap !== DEFAULT_STATE.basemap) p.set('basemap', s.basemap);
   if (s.linkColor && s.linkColor !== DEFAULT_STATE.linkColor) p.set('linkColor', s.linkColor);
-  if (s.live === false) p.set('live', '0');
+  if (s.live === true) p.set('live', '1');
   if (s.route === true) p.set('route', '1');
   return p.toString();
 }
