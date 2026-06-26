@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { fade, fly } from 'svelte/transition';
   import MapView from '$lib/MapView.svelte';
-  import { networks as fetchNetworks, nodeLinks } from '$lib/api.js';
+  import { networks as fetchNetworks, nodeLinks, routeQuery } from '$lib/api.js';
   import { NODE_TYPES, ACTIVITY, typeColor, TYPE_LABEL, TYPE_ICON } from '$lib/filters.js';
   import { readState, writeState } from '$lib/urlState.js';
   import { LAYER_OPTIONS, basemapTheme, basemapAttribution } from '$lib/basemaps.js';
@@ -40,6 +40,7 @@
   let clustering = $state(initial.cluster);
   let showAreas = $state(initial.areas);
   let showImported = $state(initial.imported);
+  let globe = $state(initial.globe);
   let basemap = $state(initial.basemap);
   let linkColor = $state(initial.linkColor);
   let layerMenuOpen = $state(false);
@@ -98,6 +99,63 @@
         linksLoading = false;
       });
   });
+
+  // --- best-effort route from the selected node to a hovered node ---
+  // When a node is selected and the cursor dwells on a *different* node, ask the
+  // API for a reliability-weighted path between them. The route is drawn on the
+  // map and explained in a panel beside the node detail. The fetch is debounced
+  // (so panning across nodes doesn't fire a request each one) and aborted on
+  // change so a fast move never lands a stale path.
+  let hoveredPk = $state('');
+  let route = $state(null);
+  let routeLoading = $state(false);
+  let routeError = $state(false);
+  let routeTarget = $state(null); // metadata of the destination node, for the panel header
+  let routeCtl; // AbortController for the in-flight request
+  let routeTimer;
+  const ROUTE_DWELL_MS = 280;
+
+  $effect(() => {
+    const from = selected;
+    const to = hoveredPk;
+    const net = filters.net;
+    const active = filters.active;
+    clearTimeout(routeTimer);
+    routeCtl?.abort();
+    // Routing only makes sense from one node to a different one.
+    if (!from || !to || from === to) {
+      route = null;
+      routeTarget = null;
+      routeLoading = false;
+      routeError = false;
+      return;
+    }
+    routeTarget = nodeByPubkey(to);
+    routeLoading = true;
+    routeError = false;
+    routeTimer = setTimeout(() => {
+      routeCtl = new AbortController();
+      routeQuery(from, to, { net, active }, routeCtl.signal)
+        .then((d) => {
+          route = d;
+          routeLoading = false;
+        })
+        .catch((e) => {
+          if (e?.name === 'AbortError') return;
+          route = null;
+          routeError = true;
+          routeLoading = false;
+        });
+    }, ROUTE_DWELL_MS);
+  });
+
+  // A route's endpoint names come from the route response, but the hovered-node
+  // header is nicer with whatever metadata the map already knows. MapView owns the
+  // node table, so fall back to the route payload's endpoint when it arrives.
+  function nodeByPubkey(pk) {
+    const n = route?.nodes?.find?.((x) => x.pubkey === pk);
+    return n ?? { pubkey: pk };
+  }
 
   // Focus a neighbor from the link list: select it (which refetches its links).
   function selectNeighbor(l) {
@@ -159,6 +217,7 @@
       cluster: clustering,
       areas: showAreas,
       imported: showImported,
+      globe,
       basemap,
       linkColor
     });
@@ -187,6 +246,26 @@
   let activeFilterCount = $derived(
     filters.types.length + (filters.net ? 1 : 0) + (filters.active !== 'all' ? 1 : 0) + (filters.q ? 1 : 0)
   );
+
+  // Summarize a found route for the panel header: hop count plus the weakest
+  // (least-active) and oldest links, which is what makes a path look shaky.
+  let routeSummary = $derived.by(() => {
+    const hops = route?.found ? route.hops ?? [] : [];
+    if (!hops.length) return null;
+    let weakest = Infinity;
+    let oldest = Infinity;
+    for (const h of hops) {
+      weakest = Math.min(weakest, h.recentActivity ?? 0);
+      oldest = Math.min(oldest, h.lastSeen ?? 0);
+    }
+    return { hops: hops.length, weakest, oldest };
+  });
+  // The destination's display name, preferring the richer map metadata when known.
+  let routeToName = $derived(
+    (route?.found && route.nodes?.length ? route.nodes[route.nodes.length - 1]?.name : '') ||
+      routeTarget?.name ||
+      'this node'
+  );
 </script>
 
 <MapView
@@ -198,12 +277,15 @@
   {clustering}
   {showImported}
   {showAreas}
+  {globe}
   {selected}
   {links}
   {linksLoading}
   {networkNames}
   {hoveredNeighbor}
+  {route}
   onselect={onSelect}
+  onhover={(pk) => (hoveredPk = pk)}
   onmove={(v) => (view = v)}
   onstatus={(s) => (status = s)}
   onready={() => (appReady = true)}
@@ -412,7 +494,7 @@
   <div>
     <div class="mb-1.5 text-[0.7rem] font-semibold uppercase tracking-wide text-dim">Display</div>
     <div class="flex flex-col gap-1">
-      {#each [{ label: 'Cluster nearby nodes', get: () => clustering, set: (v) => (clustering = v) }, { label: 'Imported nodes (meshcore.io)', get: () => showImported, set: (v) => (showImported = v) }, { label: 'Network coverage areas', get: () => showAreas, set: (v) => (showAreas = v) }] as row}
+      {#each [{ label: '3D globe view', get: () => globe, set: (v) => (globe = v) }, { label: 'Cluster nearby nodes', get: () => clustering, set: (v) => (clustering = v) }, { label: 'Imported nodes (meshcore.io)', get: () => showImported, set: (v) => (showImported = v) }, { label: 'Network coverage areas', get: () => showAreas, set: (v) => (showAreas = v) }] as row}
         <button
           onclick={() => row.set(!row.get())}
           class="flex items-center justify-between rounded-lg px-1 py-1.5 text-[0.85rem] text-ink hover:bg-elev2"
@@ -552,6 +634,66 @@
     </button>
   </div>
 </div>
+
+<!-- Best-effort route panel, sat just left of the node detail. Hover-driven, so
+     it is desktop-only (sm+). Shown whenever a route is being computed, found, or
+     known-absent for the currently hovered target. -->
+{#if selectedNode && (routeLoading || routeError || route)}
+  <aside
+    id="route-panel"
+    transition:fly={{ x: 340, duration: 220 }}
+    class="map-float absolute top-20 right-[21rem] z-30 hidden w-72 max-h-[calc(100vh-6rem)] overflow-y-auto rounded-xl border border-[#ffb454]/70 bg-elev/95 p-4 backdrop-blur sm:block"
+  >
+    <div class="flex items-center gap-2">
+      <svg class="h-4 w-4 shrink-0" style="color:#ffb454" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5" cy="19" r="2"/><circle cx="19" cy="5" r="2"/><path d="M7 18c4-1 9-6 10-11"/></svg>
+      <h3 class="truncate text-[0.92rem] font-semibold text-ink">Route to {routeToName}</h3>
+    </div>
+
+    {#if routeLoading}
+      <div class="flex items-center gap-2 py-3 text-[0.8rem] text-dim">
+        <span class="h-3.5 w-3.5 animate-spin rounded-full border-2 border-edge border-t-[#ffb454]"></span>
+        Finding a path…
+      </div>
+    {:else if routeError}
+      <div class="py-3 text-[0.8rem] text-dim">Couldn’t compute a route.</div>
+    {:else if route && !route.found}
+      <div class="py-3 text-[0.8rem] text-dim">No known path through observed links.</div>
+    {:else if route?.found}
+      {#if routeSummary}
+        <p class="mt-1 text-[0.74rem] text-dim">
+          <span class="text-ink">{routeSummary.hops}</span>
+          {routeSummary.hops === 1 ? 'hop' : 'hops'} · weakest link
+          <span title="Recent activity score">⚡ {routeSummary.weakest.toFixed(1)}</span>,
+          seen {agoLabel(routeSummary.oldest) ?? '—'}
+        </p>
+      {/if}
+      <ol class="mt-3 flex flex-col">
+        {#each route.nodes as n, i (n.pubkey + i)}
+          <li class="flex items-center gap-2">
+            <span class="h-2.5 w-2.5 shrink-0 rounded-full" style="background:{typeColor(n.type)}"></span>
+            <span class="truncate text-[0.84rem] text-ink">{n.name || 'Unnamed'}</span>
+            {#if i === 0}
+              <span class="shrink-0 rounded border border-edge px-1 text-[0.58rem] uppercase text-dim">from</span>
+            {:else if i === route.nodes.length - 1}
+              <span class="shrink-0 rounded border border-[#ffb454]/60 px-1 text-[0.58rem] uppercase text-[#ffb454]">to</span>
+            {/if}
+            {#if !n.hasGps}
+              <span class="shrink-0 rounded border border-edge px-1 text-[0.58rem] uppercase text-dim" title="No GPS — this hop isn’t drawn on the map">no gps</span>
+            {/if}
+          </li>
+          {#if i < (route.hops?.length ?? 0)}
+            {@const h = route.hops[i]}
+            <li class="my-0.5 ml-[0.3rem] flex items-center gap-2 border-l border-dashed border-[#ffb454]/50 pl-3 text-[0.68rem] text-dim">
+              <span title="Recent activity score">⚡ {(h.recentActivity ?? 0).toFixed(1)}</span>
+              <span>{agoLabel(h.lastSeen) ?? '—'}</span>
+              <span>{(h.packetCount ?? 0).toLocaleString()} pkts</span>
+            </li>
+          {/if}
+        {/each}
+      </ol>
+    {/if}
+  </aside>
+{/if}
 
 <!-- Selected node detail -->
 {#if selectedNode}

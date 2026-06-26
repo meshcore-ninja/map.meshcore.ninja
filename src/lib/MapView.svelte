@@ -14,13 +14,16 @@
     clustering = true,
     showImported = true,
     showAreas = false,
+    globe = false, // 3D globe projection vs. flat mercator
     selected = '',
     links = [], // observed links for the selected node (from /api/nodes/{pk}/links)
     linksLoading = false, // selected-node link request is in flight
     linkColor = '#c678dd', // configurable colour for the drawn link lines
     networkNames = {}, // network id -> short display name
     hoveredNeighbor = '', // pubkey of a link the panel is hovering, to highlight on the map
+    route = null, // computed route to draw: { found, nodes:[{lat,lon,...}], hops:[] }
     onselect = () => {},
+    onhover = () => {}, // pubkey under the cursor changed (drives route fetching)
     onmove = () => {},
     onstatus = () => {},
     onready = () => {}
@@ -56,6 +59,7 @@
   const EMPTY = { type: 'FeatureCollection', features: [] };
   const NODE_LAYERS = ['clusters', 'cluster-count', 'node-hover', 'node-selected', 'nodes'];
   const LINK_LAYERS = ['node-links', 'node-links-hover'];
+  const ROUTE_LAYERS = ['route-line-casing', 'route-line', 'route-nodes'];
   const NODE_CLICK_GUARD_PX = 8;
   const NETWORK_COLORS = [
     '#5aa9ff',
@@ -255,6 +259,86 @@
     else setLinkLines(hoverPk, hoverLinks);
   }
 
+  // --- computed-route source + layers ----------------------------------------
+  // The route the parent computed (selected node → hovered node) is drawn as a
+  // distinct amber path on top of the observed links: a dark casing for contrast
+  // against any basemap, the amber line itself, then dots on the intermediate
+  // relay nodes. Added after the links so it always reads as "the highlighted
+  // path", and before the node dots so endpoints stay clickable.
+  function ensureRoute() {
+    if (map.getSource('route')) return;
+    map.addSource('route', { type: 'geojson', data: EMPTY });
+    map.addLayer({
+      id: 'route-line-casing',
+      type: 'line',
+      source: 'route',
+      filter: ['==', ['geometry-type'], 'LineString'],
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-color': '#11161f', 'line-width': 7, 'line-opacity': 0.85 }
+    });
+    map.addLayer({
+      id: 'route-line',
+      type: 'line',
+      source: 'route',
+      filter: ['==', ['geometry-type'], 'LineString'],
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-color': '#ffb454', 'line-width': 3.5, 'line-opacity': 0.95 }
+    });
+    map.addLayer({
+      id: 'route-nodes',
+      type: 'circle',
+      source: 'route',
+      filter: ['==', ['geometry-type'], 'Point'],
+      paint: {
+        'circle-radius': 4,
+        'circle-color': '#ffb454',
+        'circle-stroke-color': '#11161f',
+        'circle-stroke-width': 1.5
+      }
+    });
+  }
+
+  function teardownRoute() {
+    for (const id of ROUTE_LAYERS) if (map.getLayer(id)) map.removeLayer(id);
+    if (map.getSource('route')) map.removeSource('route');
+  }
+
+  // Draw the route as per-hop segments plus relay dots. Drawing segment by segment
+  // (rather than one polyline through every node) means a hop whose endpoint has no
+  // GPS simply breaks the line there instead of drawing a misleading straight chord
+  // across it. Relay dots mark the intermediate nodes only — the endpoints already
+  // carry the selection halo and the hover ring.
+  function setRouteLine(r) {
+    if (!ready || !map.getSource('route')) return;
+    const nodes = r?.found ? r.nodes ?? [] : [];
+    const features = [];
+    for (let i = 0; i < nodes.length - 1; i++) {
+      const a = nodes[i];
+      const b = nodes[i + 1];
+      if (
+        Number.isFinite(a?.lon) && Number.isFinite(a?.lat) &&
+        Number.isFinite(b?.lon) && Number.isFinite(b?.lat)
+      ) {
+        features.push({
+          type: 'Feature',
+          geometry: { type: 'LineString', coordinates: [[a.lon, a.lat], [b.lon, b.lat]] },
+          properties: {}
+        });
+      }
+    }
+    for (let i = 1; i < nodes.length - 1; i++) {
+      const n = nodes[i];
+      if (Number.isFinite(n?.lon) && Number.isFinite(n?.lat)) {
+        features.push({
+          type: 'Feature',
+          geometry: { type: 'Point', coordinates: [n.lon, n.lat] },
+          properties: {}
+        });
+      }
+    }
+    map.getSource('route').setData({ type: 'FeatureCollection', features });
+  }
+
   function stopHoverPreview(clearLines = false) {
     clearTimeout(hoverTimer);
     hoverCtl?.abort();
@@ -322,6 +406,7 @@
   function onHoverNode(pk) {
     if (pk === hoverPk) return;
     hoverPk = pk;
+    onhover(pk); // let the parent compute a route from the selected node to here
     scheduleHoverPreview(pk);
   }
 
@@ -607,9 +692,19 @@
   // --- (re)build everything after style load -------------------------------
   function addAll() {
     ensureLinks(); // before nodes so link lines render beneath the node dots
+    ensureRoute(); // above the links, below the node dots
     ensureNodes();
     if (areasData) ensureAreas();
     buildLinkFeatures();
+    setRouteLine(route);
+  }
+
+  // Switch between the 3D globe and flat mercator projections. Projection is part
+  // of the style, so it must be re-applied after every setStyle (basemap/theme
+  // change) as well as on the reactive toggle.
+  function applyProjection() {
+    if (!map) return;
+    map.setProjection({ type: globe ? 'globe' : 'mercator' });
   }
 
   function wireInteractions() {
@@ -713,6 +808,7 @@
     map.on('load', async () => {
       addAll();
       wireInteractions();
+      applyProjection();
       ready = true;
       applyFilter(true); // render whatever (viewport) data has arrived so far
       await dataReady;
@@ -788,7 +884,14 @@
         addAll();
         applyFilter(true);
       }
+      applyProjection(); // setStyle resets projection to the style default
     });
+  });
+
+  // Toggle the globe/mercator projection live.
+  $effect(() => {
+    globe;
+    if (ready) applyProjection();
   });
 
   // Move the selection halo and (re)draw the leader line on selection change.
@@ -821,6 +924,13 @@
     links;
     selected;
     if (ready) buildLinkFeatures();
+  });
+
+  // Redraw the computed route whenever the parent supplies a new one (or clears it
+  // to null on deselect / when the cursor leaves a target node).
+  $effect(() => {
+    const r = route;
+    if (ready) setRouteLine(r);
   });
 
   // Highlight the link line the panel is hovering. Read the reactive value first

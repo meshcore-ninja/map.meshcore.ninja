@@ -16,6 +16,7 @@ export const DEFAULT_STATE = {
   cluster: false,
   areas: false,
   imported: true,
+  globe: false,
   basemap: 'auto',
   linkColor: '#c678dd'
 };
@@ -43,6 +44,7 @@ export function readState() {
     cluster: p.get('cluster') === '1', // clustering off by default
     areas: p.get('areas') === '1',
     imported: p.get('imported') !== '0', // imported nodes shown by default
+    globe: p.get('globe') === '1', // flat mercator by default
     basemap: p.get('basemap') || DEFAULT_STATE.basemap,
     linkColor: p.get('linkColor') || DEFAULT_STATE.linkColor
   };
@@ -62,6 +64,7 @@ export function toQuery(s) {
   if (s.cluster === true) p.set('cluster', '1');
   if (s.areas) p.set('areas', '1');
   if (s.imported === false) p.set('imported', '0');
+  if (s.globe === true) p.set('globe', '1');
   if (s.basemap && s.basemap !== DEFAULT_STATE.basemap) p.set('basemap', s.basemap);
   if (s.linkColor && s.linkColor !== DEFAULT_STATE.linkColor) p.set('linkColor', s.linkColor);
   return p.toString();

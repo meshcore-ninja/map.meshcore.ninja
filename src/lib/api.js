@@ -110,6 +110,30 @@ export function nodeLinks(pubkey, { net, active, limit } = {}, signal) {
   });
 }
 
+/**
+ * Best-effort route between two nodes over the observed-link graph. The backend
+ * runs a reliability-weighted shortest path (recent, busy links preferred) and
+ * returns the ordered node path plus per-hop link stats, so the panel can explain
+ * the route and the map can draw it without further requests.
+ * @param {string} from origin node pubkey (hex)
+ * @param {string} to destination node pubkey (hex)
+ * @param {object} [opts]
+ * @param {string} [opts.net] restrict the graph to links observed through this network
+ * @param {string} [opts.active] one of 24h|7d|30d (omit/`all` = no recency filter)
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<{from:string,to:string,found:boolean,nodes:any[],hops:any[]}>}
+ */
+export function routeQuery(from, to, { net, active } = {}, signal) {
+  const sp = new URLSearchParams({ from, to });
+  if (net) sp.set('networks', net);
+  if (active && active !== 'all') sp.set('active', active);
+  const url = `${API_BASE}/api/route?${sp.toString()}`;
+  return fetch(url, { signal }).then((r) => {
+    if (!r.ok) throw new Error(`route api ${r.status}`);
+    return r.json();
+  });
+}
+
 // Network coverage polygons come from the main catalog's prebuilt combined file
 // (one request, tagged per network). Overridable for local testing.
 const AREAS_ORIGIN = (import.meta.env?.VITE_AREAS_ORIGIN || 'https://meshcore.ninja').replace(
