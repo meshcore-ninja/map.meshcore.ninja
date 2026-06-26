@@ -134,6 +134,61 @@ export function routeQuery(from, to, { net, active } = {}, signal) {
   });
 }
 
+/**
+ * Subscribe to the live advert feed over a WebSocket. Every advert the backend
+ * observes is pushed as a compact frame ({@link LiveAdvert} on the server) and
+ * handed to `onAdvert`. The socket reconnects on its own with capped backoff, so
+ * a dropped connection silently recovers.
+ *
+ * Returns a disposer that closes the socket and stops reconnecting.
+ *
+ * @param {(advert:object)=>void} onAdvert called once per advert frame
+ * @param {object} [opts]
+ * @param {(open:boolean)=>void} [opts.onStatus] connection up/down notifications
+ * @returns {() => void} stop the subscription
+ */
+export function liveAdverts(onAdvert, { onStatus } = {}) {
+  if (typeof WebSocket === 'undefined') return () => {};
+  const url = `${API_BASE.replace(/^http/, 'ws')}/api/live`;
+  let ws;
+  let closed = false;
+  let backoff = 1000;
+  let retryTimer;
+
+  const connect = () => {
+    if (closed) return;
+    ws = new WebSocket(url);
+    ws.onopen = () => {
+      backoff = 1000; // reset once a connection succeeds
+      onStatus?.(true);
+    };
+    ws.onmessage = (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      if (msg && msg.kind === 'advert') onAdvert(msg);
+    };
+    ws.onclose = () => {
+      onStatus?.(false);
+      if (closed) return;
+      retryTimer = setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 15000);
+    };
+    // An error is always followed by a close, where the retry is scheduled.
+    ws.onerror = () => ws.close();
+  };
+
+  connect();
+  return () => {
+    closed = true;
+    clearTimeout(retryTimer);
+    ws?.close();
+  };
+}
+
 // Network coverage polygons come from the main catalog's prebuilt combined file
 // (one request, tagged per network). Overridable for local testing.
 const AREAS_ORIGIN = (import.meta.env?.VITE_AREAS_ORIGIN || 'https://meshcore.ninja').replace(

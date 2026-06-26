@@ -43,6 +43,9 @@
   let globe = $state(initial.globe);
   let basemap = $state(initial.basemap);
   let linkColor = $state(initial.linkColor);
+  let liveEnabled = $state(initial.live); // realtime advert pulses
+  let liveConnected = $state(false); // live feed socket is currently open
+  let routeEnabled = $state(initial.route); // best-effort route resolving (Advanced)
   let layerMenuOpen = $state(false);
   let attribOpen = $state(false);
 
@@ -122,10 +125,12 @@
     const to = hoveredPk;
     const net = filters.net;
     const active = filters.active;
+    const enabled = routeEnabled;
     clearTimeout(routeTimer);
     routeCtl?.abort();
-    // Routing only makes sense from one node to a different one.
-    if (!from || !to || from === to) {
+    // Route resolving is opt-in (Advanced), and only makes sense from one node to
+    // a different one.
+    if (!enabled || !from || !to || from === to) {
       route = null;
       routeLoading = false;
       routeError = false;
@@ -211,7 +216,9 @@
       imported: showImported,
       globe,
       basemap,
-      linkColor
+      linkColor,
+      live: liveEnabled,
+      route: routeEnabled
     });
   });
 
@@ -277,6 +284,8 @@
   {networkNames}
   {hoveredNeighbor}
   {route}
+  live={liveEnabled}
+  onlive={(open) => (liveConnected = open)}
   onselect={onSelect}
   onhover={(pk, node) => {
     hoveredPk = pk;
@@ -328,6 +337,15 @@
           class="rounded-full border border-accent2/40 bg-accent2/10 px-1.5 py-0.5 text-[0.58rem] font-semibold uppercase leading-none tracking-wider text-accent2"
           >Alpha</span
         >
+        {#if liveEnabled}
+          <span
+            class="flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[0.58rem] font-semibold uppercase leading-none tracking-wider transition-colors {liveConnected ? 'border-accent/40 bg-accent/10 text-accent' : 'border-edge text-dim'}"
+            title={liveConnected ? 'Receiving live adverts' : 'Connecting to live feed…'}
+          >
+            <span class="live-dot {liveConnected ? 'is-on' : ''}"></span>
+            Live
+          </span>
+        {/if}
       </div>
       <div class="text-[0.72rem] text-dim">
         {#if status.loading}
@@ -490,7 +508,7 @@
   <div>
     <div class="mb-1.5 text-[0.7rem] font-semibold uppercase tracking-wide text-dim">Display</div>
     <div class="flex flex-col gap-1">
-      {#each [{ label: '3D globe view', get: () => globe, set: (v) => (globe = v) }, { label: 'Cluster nearby nodes', get: () => clustering, set: (v) => (clustering = v) }, { label: 'Imported nodes (meshcore.io)', get: () => showImported, set: (v) => (showImported = v) }, { label: 'Network coverage areas', get: () => showAreas, set: (v) => (showAreas = v) }] as row}
+      {#each [{ label: 'Live advert pulses', get: () => liveEnabled, set: (v) => (liveEnabled = v) }, { label: '3D globe view', get: () => globe, set: (v) => (globe = v) }, { label: 'Cluster nearby nodes', get: () => clustering, set: (v) => (clustering = v) }, { label: 'Imported nodes (meshcore.io)', get: () => showImported, set: (v) => (showImported = v) }, { label: 'Network coverage areas', get: () => showAreas, set: (v) => (showAreas = v) }] as row}
         <button
           onclick={() => row.set(!row.get())}
           class="flex items-center justify-between rounded-lg px-1 py-1.5 text-[0.85rem] text-ink hover:bg-elev2"
@@ -519,7 +537,20 @@
       </svg>
     </summary>
     <div class="mt-2.5">
-      <div class="mb-1.5 text-[0.72rem] text-dim">Link colour</div>
+      <button
+        onclick={() => (routeEnabled = !routeEnabled)}
+        class="flex w-full items-center justify-between rounded-lg px-1 py-1.5 text-[0.85rem] text-ink hover:bg-elev2"
+      >
+        <span class="flex flex-col items-start">
+          Resolve routes on hover
+          <span class="text-[0.68rem] text-dim">Draw a best-effort path to the hovered node</span>
+        </span>
+        <span class="relative h-5 w-9 shrink-0 rounded-full transition-colors {routeEnabled ? 'bg-accent' : 'bg-edge'}">
+          <span class="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all {routeEnabled ? 'left-[1.125rem]' : 'left-0.5'}"></span>
+        </span>
+      </button>
+
+      <div class="mb-1.5 mt-3 text-[0.72rem] text-dim">Link colour</div>
       <div class="flex flex-wrap items-center gap-2">
         {#each LINK_COLORS as c}
           <button
@@ -796,6 +827,32 @@
 {/if}
 
 <style>
+  .live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background: var(--color-dim);
+  }
+  .live-dot.is-on {
+    background: var(--color-accent);
+    animation: live-blink 1.6s ease-in-out infinite;
+  }
+  @keyframes live-blink {
+    0%,
+    100% {
+      opacity: 1;
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-accent) 60%, transparent);
+    }
+    50% {
+      opacity: 0.5;
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 0%, transparent);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .live-dot.is-on {
+      animation: none;
+    }
+  }
   .preloader {
     position: fixed;
     inset: 0;

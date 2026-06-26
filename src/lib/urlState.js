@@ -18,7 +18,9 @@ export const DEFAULT_STATE = {
   imported: true,
   globe: false,
   basemap: 'auto',
-  linkColor: '#c678dd'
+  linkColor: '#c678dd',
+  live: true, // real-time advert pulses, on by default
+  route: false // best-effort route resolving, off by default (Advanced)
 };
 
 const num = (v, d) => {
@@ -46,7 +48,9 @@ export function readState() {
     imported: p.get('imported') !== '0', // imported nodes shown by default
     globe: p.get('globe') === '1', // flat mercator by default
     basemap: p.get('basemap') || DEFAULT_STATE.basemap,
-    linkColor: p.get('linkColor') || DEFAULT_STATE.linkColor
+    linkColor: p.get('linkColor') || DEFAULT_STATE.linkColor,
+    live: p.get('live') !== '0', // live pulses on by default
+    route: p.get('route') === '1' // route resolving off by default
   };
 }
 
@@ -67,6 +71,8 @@ export function toQuery(s) {
   if (s.globe === true) p.set('globe', '1');
   if (s.basemap && s.basemap !== DEFAULT_STATE.basemap) p.set('basemap', s.basemap);
   if (s.linkColor && s.linkColor !== DEFAULT_STATE.linkColor) p.set('linkColor', s.linkColor);
+  if (s.live === false) p.set('live', '0');
+  if (s.route === true) p.set('route', '1');
   return p.toString();
 }
 

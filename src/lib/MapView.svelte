@@ -2,7 +2,7 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import maplibregl from 'maplibre-gl';
   import 'maplibre-gl/dist/maplibre-gl.css';
-  import { allNodes, viewportNodes, networkAreas, nodeLinks } from '$lib/api.js';
+  import { allNodes, viewportNodes, networkAreas, nodeLinks, liveAdverts } from '$lib/api.js';
   import { makeNodePredicate, TYPE_COLOR, DEFAULT_COLOR } from '$lib/filters.js';
   import { basemapTiles, basemapAttribution } from '$lib/basemaps.js';
 
@@ -22,7 +22,9 @@
     networkNames = {}, // network id -> short display name
     hoveredNeighbor = '', // pubkey of a link the panel is hovering, to highlight on the map
     route = null, // computed route to draw: { found, nodes:[{lat,lon,...}], hops:[] }
+    live = true, // subscribe to the realtime advert feed and pulse new sightings
     onselect = () => {},
+    onlive = () => {}, // live feed connection up/down (true/false)
     onhover = () => {}, // pubkey under the cursor changed (drives route fetching)
     onmove = () => {},
     onstatus = () => {},
@@ -60,6 +62,33 @@
   const NODE_LAYERS = ['clusters', 'cluster-count', 'node-hover', 'node-selected', 'nodes'];
   const LINK_LAYERS = ['node-links', 'node-links-hover'];
   const ROUTE_LAYERS = ['route-line-casing', 'route-line', 'route-nodes'];
+  const LIVE_LAYERS = ['live-pulse-ring', 'live-pulse-core'];
+  // Explicit draw order (bottom → top) for everything we stack above the basemap
+  // and the network-area overlay. Asserted by restackLayers() after any structural
+  // change (initial build, clustering rebuild, lazy link/route/live adds) so the
+  // order never depends on insertion timing: observed links and live advert pulses
+  // always sit above the node dots, with pulses on top of all.
+  const LAYER_STACK = [
+    'route-line-casing',
+    'route-line',
+    'route-nodes',
+    'clusters',
+    'cluster-count',
+    'nodes',
+    'node-hover',
+    'node-selected',
+    'node-links',
+    'node-links-hover',
+    'live-pulse-ring',
+    'live-pulse-core'
+  ];
+
+  // Re-assert the stack: moving each present layer to the top in order leaves the
+  // last one on top. The network-area layers aren't listed, so they stay beneath.
+  function restackLayers() {
+    if (!map) return;
+    for (const id of LAYER_STACK) if (map.getLayer(id)) map.moveLayer(id);
+  }
   const NODE_CLICK_GUARD_PX = 8;
   const NETWORK_COLORS = [
     '#5aa9ff',
@@ -339,6 +368,114 @@
     map.getSource('route').setData({ type: 'FeatureCollection', features });
   }
 
+  // --- live advert pulses -----------------------------------------------------
+  // Realtime adverts arrive over a WebSocket (see liveAdverts in api.js). Each one
+  // drops a short-lived expanding ring + bright core at the node's location. The
+  // pulses live in a plain array animated by one rAF loop that only runs while
+  // something is pulsing and feeds a single reusable GeoJSON source — so at rest
+  // this costs nothing, and a burst of adverts is just a few features per frame.
+  let liveStop; // disposer returned by liveAdverts()
+  let pulses = []; // { lon, lat, color, start } active pulses
+  let pulseRaf = 0;
+  const PULSE_MS = 2200;
+  const MAX_PULSES = 80; // hard cap so a flood can't grow the array unbounded
+
+  function ensureLive() {
+    if (map.getSource('live-adverts')) return;
+    map.addSource('live-adverts', { type: 'geojson', data: EMPTY });
+    // Expanding hollow ring.
+    map.addLayer({
+      id: 'live-pulse-ring',
+      type: 'circle',
+      source: 'live-adverts',
+      paint: {
+        'circle-radius': ['get', 'radius'],
+        'circle-color': ['get', 'color'],
+        'circle-opacity': 0,
+        'circle-stroke-color': ['get', 'color'],
+        'circle-stroke-width': 2,
+        'circle-stroke-opacity': ['get', 'opacity']
+      }
+    });
+    // Bright core that fades fast, marking the node itself.
+    map.addLayer({
+      id: 'live-pulse-core',
+      type: 'circle',
+      source: 'live-adverts',
+      paint: {
+        'circle-radius': 5,
+        'circle-color': ['get', 'color'],
+        'circle-opacity': ['get', 'coreOpacity'],
+        'circle-stroke-color': '#fff',
+        'circle-stroke-width': 1,
+        'circle-stroke-opacity': ['*', ['get', 'coreOpacity'], 0.7]
+      }
+    });
+  }
+
+  function tickPulses() {
+    pulseRaf = 0;
+    if (!ready || !map.getSource('live-adverts')) {
+      pulses = [];
+      return;
+    }
+    const now = performance.now();
+    const features = [];
+    const next = [];
+    for (const p of pulses) {
+      const t = (now - p.start) / PULSE_MS;
+      if (t >= 1) continue;
+      next.push(p);
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [p.lon, p.lat] },
+        properties: {
+          color: p.color,
+          radius: 5 + t * 24, // grow 5 -> 29 px
+          opacity: (1 - t) * 0.75, // ring fades out over its life
+          coreOpacity: Math.max(0, 1 - t * 2.2) * 0.9 // core fades in the first ~45%
+        }
+      });
+    }
+    pulses = next;
+    map.getSource('live-adverts').setData({ type: 'FeatureCollection', features });
+    if (pulses.length) pulseRaf = requestAnimationFrame(tickPulses);
+  }
+
+  // Drop a pulse for one advert, resolving its location from the advert's own GPS
+  // or, failing that, the node's last known position in the loaded set.
+  function addPulse(adv) {
+    if (!live || !ready) return;
+    let lon = adv.hasGps ? adv.lon : undefined;
+    let lat = adv.hasGps ? adv.lat : undefined;
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+      const n = byPubkey.get(adv.pubkey);
+      if (n && Number.isFinite(n.lon) && Number.isFinite(n.lat)) {
+        lon = n.lon;
+        lat = n.lat;
+      }
+    }
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) return; // can't place it
+    if (pulses.length >= MAX_PULSES) pulses.shift(); // drop the oldest
+    pulses.push({ lon, lat, color: TYPE_COLOR[adv.type] ?? DEFAULT_COLOR, start: performance.now() });
+    if (!pulseRaf) pulseRaf = requestAnimationFrame(tickPulses);
+  }
+
+  function startLive() {
+    if (liveStop || !live) return;
+    liveStop = liveAdverts(addPulse, { onStatus: (open) => onlive(open) });
+  }
+
+  function stopLive() {
+    liveStop?.();
+    liveStop = undefined;
+    onlive(false);
+    pulses = [];
+    cancelAnimationFrame(pulseRaf);
+    pulseRaf = 0;
+    if (map?.getSource('live-adverts')) map.getSource('live-adverts').setData(EMPTY);
+  }
+
   function stopHoverPreview(clearLines = false) {
     clearTimeout(hoverTimer);
     hoverCtl?.abort();
@@ -550,6 +687,7 @@
     if (!ready) return;
     teardownNodes();
     ensureNodes();
+    restackLayers(); // re-adding nodes appends them on top; push them back under links/pulses
     applyFilter(true);
   }
 
@@ -691,10 +829,12 @@
 
   // --- (re)build everything after style load -------------------------------
   function addAll() {
-    ensureLinks(); // before nodes so link lines render beneath the node dots
-    ensureRoute(); // above the links, below the node dots
+    ensureLinks();
+    ensureRoute();
     ensureNodes();
     if (areasData) ensureAreas();
+    ensureLive();
+    restackLayers(); // enforce links + pulses above the node dots
     buildLinkFeatures();
     setRouteLine(route);
   }
@@ -824,6 +964,7 @@
 
   onDestroy(() => {
     stopHoverPreview();
+    stopLive();
     map?.remove();
   });
 
@@ -931,6 +1072,14 @@
   $effect(() => {
     const r = route;
     if (ready) setRouteLine(r);
+  });
+
+  // Open or close the live advert feed as the toggle changes. untrack so the
+  // start/stop helpers (which touch non-reactive map state) don't re-run this.
+  $effect(() => {
+    live;
+    if (!ready) return;
+    untrack(() => (live ? startLive() : stopLive()));
   });
 
   // Highlight the link line the panel is hovering. Read the reactive value first
