@@ -73,15 +73,11 @@ const stadiaThumb = (style, ext = 'png') =>
 // style — the UI never clashes with the map. CARTO entries use basemap 'auto'
 // (theme-following tiles); the others set their basemap directly.
 export const LAYER_OPTIONS = [
-  { key: 'carto-light', label: 'Carto Light', basemap: 'auto', theme: 'light', thumb: cartoThumb('light') },
-  { key: 'carto-dark', label: 'Carto Dark', basemap: 'auto', theme: 'dark', thumb: cartoThumb('dark') },
   { key: 'carto-voyager', label: 'Carto Voyager', basemap: 'carto-voyager', theme: 'light', thumb: voyagerThumb },
+  { key: 'carto-dark', label: 'Carto Dark', basemap: 'auto', theme: 'dark', thumb: cartoThumb('dark') },
+  { key: 'carto-light', label: 'Carto Light', basemap: 'auto', theme: 'light', thumb: cartoThumb('light') },
   { key: 'osm', label: 'OpenStreetMap', basemap: 'osm', theme: 'light', thumb: osmThumb },
   { key: 'mapy', label: 'Mapy.com', basemap: 'mapy', theme: 'light', thumb: mapyThumb('basic') },
-  { key: 'stadia-outdoors', label: 'Stadia Outdoors', basemap: 'stadia-outdoors', theme: 'light', thumb: stadiaThumb('outdoors') },
-  { key: 'stadia-smooth-light', label: 'Stadia Smooth', basemap: 'stadia-smooth-light', theme: 'light', thumb: stadiaThumb('alidade_smooth') },
-  { key: 'stadia-smooth-dark', label: 'Stadia Smooth Dark', basemap: 'stadia-smooth-dark', theme: 'dark', thumb: stadiaThumb('alidade_smooth_dark') },
-  { key: 'stadia-satellite', label: 'Stadia Satellite', basemap: 'stadia-satellite', theme: 'dark', thumb: stadiaThumb('alidade_satellite', 'jpg') },
 ];
 
 export const DEFAULT_BASEMAP = 'auto';

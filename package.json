@@ -4,7 +4,7 @@
   "description": "A fast, global map of MeshCore nodes — viewport-progressive clusters served by the MeshCore Ninja API.",
   "type": "module",
   "scripts": {
-    "dev": "vite dev",
+    "dev": "VITE_API_BASE=https://api.meshcore.ninja VITE_AREAS_ORIGIN=https://meshcore.ninja vite dev",
     "build": "vite build",
     "preview": "vite preview"
   },
@@ -18,6 +18,9 @@
     "vite": "^8.0.16"
   },
   "dependencies": {
+    "bits-ui": "^2.18.1",
+    "country-flag-icons": "^1.6.19",
+    "fuse.js": "^7.4.2",
     "maplibre-gl": "^5.6.0"
   }
 }

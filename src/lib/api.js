@@ -1,5 +1,7 @@
 // Client for the MeshCore Ninja API.
 
+import { nodeBandId } from '$lib/nodeMeta.js';
+
 export const API_BASE = (import.meta.env?.VITE_API_BASE || 'https://api.meshcore.ninja').replace(
   /\/+$/,
   ''
@@ -17,7 +19,7 @@ export const API_BASE = (import.meta.env?.VITE_API_BASE || 'https://api.meshcore
 
 const NODE_TYPE_NAMES = { 1: 'chat', 2: 'repeater', 3: 'room', 4: 'sensor' };
 
-function tupleToFeature([pubkey, name, type, lat, lon, lastAdvertAt, advertCount, networks]) {
+function tupleToFeature([pubkey, name, type, lat, lon, lastAdvertAt, advertCount, networks, freq]) {
   return {
     type: 'Feature',
     geometry: { type: 'Point', coordinates: [lon, lat] },
@@ -30,7 +32,11 @@ function tupleToFeature([pubkey, name, type, lat, lon, lastAdvertAt, advertCount
       lastAdvertAt,
       advertCount,
       networks: Array.isArray(networks) ? networks : [],
-      imported: advertCount === 0
+      imported: advertCount === 0,
+      // Imported (unsigned) nodes carry their own radio frequency (MHz) but no
+      // network membership; live nodes get 0 and band via their networks.
+      freq: Number.isFinite(freq) ? freq : 0,
+      band: '' // filled in by loadSnapshot once the network/band catalogs load
     }
   };
 }
@@ -58,11 +64,17 @@ async function loadSnapshot() {
   cachedSnapshotURL = url;
   snapshotPromise = (async () => {
     // The browser automatically decompresses the zstd body (Chrome 123+,
-    // Firefox 126+, Safari 17.4+) and applies the immutable cache entry.
-    const res = await fetch(url);
+    // Firefox 126+, Safari 17.4+) and applies the immutable cache entry. The
+    // network catalog is fetched in parallel so we can assign each node a band
+    // id (live: via its networks; imported: via its own radio frequency).
+    const [res, netCatalog] = await Promise.all([fetch(url), meshNetworks().catch(() => ({}))]);
     if (!res.ok) throw new Error(`snapshot ${res.status}`);
     const payload = await res.json();
-    return (payload.nodes ?? []).map(tupleToFeature);
+    const features = (payload.nodes ?? []).map(tupleToFeature);
+    for (const f of features) {
+      f.properties.band = nodeBandId(f.properties.networks, netCatalog, f.properties.freq);
+    }
+    return features;
   })();
   return snapshotPromise;
 }
@@ -204,6 +216,47 @@ export function networkAreas() {
       .catch(() => ({ type: 'FeatureCollection', features: [] }));
   }
   return areasPromise;
+}
+
+// Origin of the MeshCore Ninja catalog that publishes networks.json + bands.json
+// (network metadata and LoRa band definitions). Overridable for local testing.
+const CATALOG_ORIGIN = (import.meta.env?.VITE_CATALOG_ORIGIN || 'https://meshcore.ninja').replace(
+  /\/+$/,
+  ''
+);
+
+let meshNetworksPromise;
+/**
+ * The full network catalog from the site's networks.json (a flat array), keyed
+ * by network id, so each network chip can show its flag(s), name and derive the
+ * node's band. Fetched once and memoised; failures resolve to an empty map.
+ * @returns {Promise<Record<string, any>>}
+ */
+export function meshNetworks() {
+  if (!meshNetworksPromise) {
+    meshNetworksPromise = fetch(`${CATALOG_ORIGIN}/networks.json`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then((list) => Object.fromEntries((Array.isArray(list) ? list : []).map((n) => [n.id, n])))
+      .catch(() => ({}));
+  }
+  return meshNetworksPromise;
+}
+
+let bandsPromise;
+/**
+ * The LoRa band catalog from the site's bands.json, keyed by band id (e.g. "868",
+ * "915"), each `{name, range, region, color}`. Used to render a node's band
+ * badge. Fetched once and memoised; failures resolve to an empty map.
+ * @returns {Promise<Record<string, {name:string,range:string,region:string,color:string}>>}
+ */
+export function bands() {
+  if (!bandsPromise) {
+    bandsPromise = fetch(`${CATALOG_ORIGIN}/bands.json`)
+      .then((r) => (r.ok ? r.json() : {}))
+      .then((d) => (d && typeof d === 'object' ? d : {}))
+      .catch(() => ({}));
+  }
+  return bandsPromise;
 }
 
 let networksPromise;

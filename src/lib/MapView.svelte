@@ -2,8 +2,8 @@
   import { onMount, onDestroy, untrack } from 'svelte';
   import maplibregl from 'maplibre-gl';
   import 'maplibre-gl/dist/maplibre-gl.css';
-  import { allNodes, viewportNodes, networkAreas, nodeLinks, liveAdverts } from '$lib/api.js';
-  import { makeNodePredicate, TYPE_COLOR, DEFAULT_COLOR } from '$lib/filters.js';
+  import { allNodes, viewportNodes, networkAreas, nodeLinks } from '$lib/api.js';
+  import { makeNodePredicate, TYPE_COLOR, TYPE_ICON, DEFAULT_COLOR } from '$lib/filters.js';
   import { basemapTiles, basemapAttribution } from '$lib/basemaps.js';
 
   let {
@@ -14,21 +14,23 @@
     clustering = true,
     showImported = true,
     showAreas = false,
-    globe = false, // 3D globe projection vs. flat mercator
+    colorByBand = false, // colour node dots by LoRa band instead of node type
+    bandsCatalog = {}, // band id -> { region, color } (from bands.json)
+    emphasizedNet = '', // network id to frame (from a search "open network")
+    emphasizedAreaIds = [], // network ids whose coverage borders to emphasise (family)
+    networkMemberIds = [], // network ids whose nodes to keep visible (family, or one on hover)
+    globe = true, // 3D globe projection vs. flat mercator
     selected = '',
     links = [], // observed links for the selected node (from /api/nodes/{pk}/links)
     linksLoading = false, // selected-node link request is in flight
     linkColor = '#c678dd', // configurable colour for the drawn link lines
     networkNames = {}, // network id -> short display name
     hoveredNeighbor = '', // pubkey of a link the panel is hovering, to highlight on the map
-    route = null, // computed route to draw: { found, nodes:[{lat,lon,...}], hops:[] }
-    live = true, // subscribe to the realtime advert feed and pulse new sightings
     onselect = () => {},
-    onlive = () => {}, // live feed connection up/down (true/false)
-    onhover = () => {}, // pubkey under the cursor changed (drives route fetching)
     onmove = () => {},
     onstatus = () => {},
-    onready = () => {}
+    onready = () => {},
+    onhoverlink = () => {} // hovering a link line on the map (pubkey of its neighbor, '' on leave)
   } = $props();
 
   let container;
@@ -61,17 +63,7 @@
   const EMPTY = { type: 'FeatureCollection', features: [] };
   const NODE_LAYERS = ['clusters', 'cluster-count', 'node-hover', 'node-selected', 'nodes'];
   const LINK_LAYERS = ['node-links', 'node-links-hover'];
-  const ROUTE_LAYERS = ['route-line-casing', 'route-line', 'route-nodes'];
-  const LIVE_LAYERS = ['live-pulse-ring', 'live-pulse-core'];
-  // Explicit draw order (bottom → top) for everything we stack above the basemap
-  // and the network-area overlay. Asserted by restackLayers() after any structural
-  // change (initial build, clustering rebuild, lazy link/route/live adds) so the
-  // order never depends on insertion timing: observed links and live advert pulses
-  // always sit above the node dots, with pulses on top of all.
   const LAYER_STACK = [
-    'route-line-casing',
-    'route-line',
-    'route-nodes',
     'clusters',
     'cluster-count',
     'nodes',
@@ -79,8 +71,6 @@
     'node-selected',
     'node-links',
     'node-links-hover',
-    'live-pulse-ring',
-    'live-pulse-core'
   ];
 
   // Re-assert the stack: moving each present layer to the top in order leaves the
@@ -149,6 +139,27 @@
   for (const [t, c] of Object.entries(TYPE_COLOR)) typeColorExpr.push(Number(t), c);
   typeColorExpr.push(DEFAULT_COLOR);
 
+  // Default node colouring: imported nodes grey, live nodes by type.
+  const typeCircleColor = ['case', ['==', ['get', 'imported'], true], DEFAULT_COLOR, typeColorExpr];
+
+  // Colouring by LoRa band: match the node's band id to its band colour, from
+  // bands.json. Nodes with no resolved band fall back to grey.
+  function bandCircleColor(catalog) {
+    const expr = ['match', ['get', 'band']];
+    for (const [id, band] of Object.entries(catalog ?? {})) {
+      if (band?.color) expr.push(String(id), band.color);
+    }
+    if (expr.length === 2) return DEFAULT_COLOR; // no bands yet: solid grey
+    expr.push(DEFAULT_COLOR);
+    return expr;
+  }
+
+  // Repaint the node dots when the band toggle flips or the band catalog loads.
+  $effect(() => {
+    const color = colorByBand ? bandCircleColor(bandsCatalog) : typeCircleColor;
+    if (ready && map?.getLayer('nodes')) map.setPaintProperty('nodes', 'circle-color', color);
+  });
+
   // --- network-area overlay --------------------------------------------------
   function ensureAreas() {
     if (!areasData || map.getSource('areas')) return;
@@ -195,6 +206,30 @@
 
   function updateAreas() {
     if (!map.getLayer('area-fill')) return;
+
+    // An explicitly opened network (from search) wins: frame only it, with a
+    // bolder border and a faint fill so it reads as emphasised.
+    if (emphasizedNet) {
+      // Show the coverage borders of the whole family (the network plus its
+      // subnetworks), so the subregion shapes are visible, not just the parent.
+      const ids = emphasizedAreaIds.length ? emphasizedAreaIds : [emphasizedNet];
+      const filter = ['in', ['get', 'networkId'], ['literal', ids]];
+      for (const id of ['area-fill', 'area-line']) {
+        map.setLayoutProperty(id, 'visibility', 'visible');
+        map.setFilter(id, filter);
+      }
+      map.setPaintProperty('area-fill', 'fill-opacity', 0.12);
+      map.setPaintProperty('area-line', 'line-width', 5);
+      map.setPaintProperty('area-line', 'line-opacity', 1);
+      map.setPaintProperty('area-line', 'line-blur', 0.4);
+      return;
+    }
+
+    // Restore the default border styling (in case we were just emphasising one).
+    map.setPaintProperty('area-line', 'line-width', 4);
+    map.setPaintProperty('area-line', 'line-opacity', 0.95);
+    map.setPaintProperty('area-line', 'line-blur', 0.8);
+
     const selNets = selectedNetworks();
     const hoverNets = hoveredNetworks();
     const framedNets = selNets.length ? selNets : hoverNets;
@@ -211,6 +246,30 @@
     // Selection and hover use the same border-only treatment. The fill belongs
     // only to the explicit persistent coverage-area toggle.
     map.setPaintProperty('area-fill', 'fill-opacity', showAreas ? 0.08 : 0);
+  }
+
+  // Fit the camera to a network's coverage polygon(s). Leaves room for the detail
+  // panel (right on wide screens, bottom on narrow ones).
+  let lastEmphFit = '';
+  function fitToNetwork(netId) {
+    if (!map || !areasData) return;
+    const b = new maplibregl.LngLatBounds();
+    const extend = (coords) => {
+      if (typeof coords[0] === 'number') b.extend(coords);
+      else for (const c of coords) extend(c);
+    };
+    let any = false;
+    for (const f of areasData.features ?? []) {
+      if (f.properties?.networkId !== netId || !f.geometry?.coordinates) continue;
+      extend(f.geometry.coordinates);
+      any = true;
+    }
+    if (!any || b.isEmpty()) return;
+    const wide = map.getContainer().clientWidth >= 640;
+    const padding = wide
+      ? { top: 90, right: 360, bottom: 90, left: 90 }
+      : { top: 90, right: 60, bottom: 320, left: 60 };
+    map.fitBounds(b, { padding, maxZoom: 12, duration: 800 });
   }
 
   // --- observed-link source + layers -----------------------------------------
@@ -255,225 +314,95 @@
     if (map.getSource('node-links')) map.removeSource('node-links');
   }
 
+  // Growth animation state for link lines: which origin is currently shown (so we
+  // only re-animate when a fresh set appears) and the in-flight rAF handle.
+  let linkAnim = 0;
+  let shownLinkOrigin = '';
+  let shownLinkCount = 0;
+  const reduceMotion =
+    typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
   // Draw link LineStrings from one origin node to its neighbours. Only neighbours
-  // with GPS are drawable; the rest still show in the panel list.
+  // with GPS are drawable; the rest still show in the panel list. When a fresh
+  // set appears (new origin, or lines coming back after none) the segments grow
+  // out from the origin node so they read as "flying" to their neighbours.
   function setLinkLines(originPk, linkList) {
     if (!ready || !map.getSource('node-links')) return;
+    cancelAnimationFrame(linkAnim);
     const origin = originPk ? byPubkey.get(originPk) : null;
     if (!origin || !Number.isFinite(origin.lon) || !Number.isFinite(origin.lat)) {
       map.getSource('node-links').setData(EMPTY);
+      shownLinkOrigin = originPk || '';
+      shownLinkCount = 0;
       return;
     }
+    const o = [origin.lon, origin.lat];
     const now = Date.now() / 1000;
-    const features = [];
+    const targets = [];
     for (const l of linkList ?? []) {
       const nb = l.neighbor;
       if (!nb?.hasGps || !Number.isFinite(nb.lat) || !Number.isFinite(nb.lon)) continue;
       const ageDays = Math.max(0, (now - (l.lastSeen ?? 0)) / 86400);
       const recency = Math.exp(-ageDays / 7); // ~1 week falloff
       const width = Math.min(6, Math.max(1.2, Math.log1p(l.recentActivity ?? 0) * 1.6));
-      features.push({
-        type: 'Feature',
-        geometry: { type: 'LineString', coordinates: [[origin.lon, origin.lat], [nb.lon, nb.lat]] },
-        properties: { neighbor: nb.pubkey, width, recency }
-      });
+      targets.push({ end: [nb.lon, nb.lat], properties: { neighbor: nb.pubkey, width, recency } });
     }
-    map.getSource('node-links').setData({ type: 'FeatureCollection', features });
+
+    const src = map.getSource('node-links');
+    const collect = (progress) => ({
+      type: 'FeatureCollection',
+      features: targets.map((t) => ({
+        type: 'Feature',
+        geometry: {
+          type: 'LineString',
+          coordinates: [o, [o[0] + (t.end[0] - o[0]) * progress, o[1] + (t.end[1] - o[1]) * progress]]
+        },
+        properties: t.properties
+      }))
+    });
+
+    // Animate only when a new set appears; a plain redraw (same origin, e.g. a
+    // style reload) or reduced-motion just snaps to the final geometry.
+    const appearing = targets.length > 0 && (originPk !== shownLinkOrigin || shownLinkCount === 0);
+    shownLinkOrigin = originPk;
+    shownLinkCount = targets.length;
+
+    if (!appearing || reduceMotion) {
+      src.setData(collect(1));
+      return;
+    }
+
+    const duration = 460;
+    const start = performance.now();
+    const ease = (t) => 1 - Math.pow(1 - t, 3); // easeOutCubic
+    const step = (nowMs) => {
+      if (!map || !map.getSource('node-links')) return; // source gone mid-flight
+      const t = Math.min(1, (nowMs - start) / duration);
+      src.setData(collect(ease(t)));
+      if (t < 1) linkAnim = requestAnimationFrame(step);
+    };
+    src.setData(collect(0));
+    linkAnim = requestAnimationFrame(step);
   }
 
   // Selection draws the link set supplied by the parent; a hover (when nothing is
   // selected) previews the hovered node's links fetched on the fly.
   function buildLinkFeatures() {
-    if (selected) setLinkLines(selected, links);
-    else setLinkLines(hoverPk, hoverLinks);
-  }
-
-  // --- computed-route source + layers ----------------------------------------
-  // The route the parent computed (selected node → hovered node) is drawn as a
-  // distinct amber path on top of the observed links: a dark casing for contrast
-  // against any basemap, the amber line itself, then dots on the intermediate
-  // relay nodes. Added after the links so it always reads as "the highlighted
-  // path", and before the node dots so endpoints stay clickable.
-  function ensureRoute() {
-    if (map.getSource('route')) return;
-    map.addSource('route', { type: 'geojson', data: EMPTY });
-    map.addLayer({
-      id: 'route-line-casing',
-      type: 'line',
-      source: 'route',
-      filter: ['==', ['geometry-type'], 'LineString'],
-      layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: { 'line-color': '#11161f', 'line-width': 7, 'line-opacity': 0.85 }
-    });
-    map.addLayer({
-      id: 'route-line',
-      type: 'line',
-      source: 'route',
-      filter: ['==', ['geometry-type'], 'LineString'],
-      layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: { 'line-color': '#ffb454', 'line-width': 3.5, 'line-opacity': 0.95 }
-    });
-    map.addLayer({
-      id: 'route-nodes',
-      type: 'circle',
-      source: 'route',
-      filter: ['==', ['geometry-type'], 'Point'],
-      paint: {
-        'circle-radius': 4,
-        'circle-color': '#ffb454',
-        'circle-stroke-color': '#11161f',
-        'circle-stroke-width': 1.5
+    if (selected) {
+      if (links.length) {
+        setLinkLines(selected, links);
+      } else if (shownLinkOrigin === selected && shownLinkCount > 0) {
+        // Clicking a node whose links are already on screen (e.g. from the hover
+        // preview) shouldn't blank them and re-fly them in while the selection's
+        // own fetch runs — the visible lines already belong to this node, so keep
+        // them until the fetched set snaps in.
+        return;
+      } else {
+        setLinkLines(selected, links); // different node (or none): clear
       }
-    });
-  }
-
-  function teardownRoute() {
-    for (const id of ROUTE_LAYERS) if (map.getLayer(id)) map.removeLayer(id);
-    if (map.getSource('route')) map.removeSource('route');
-  }
-
-  // Draw the route as per-hop segments plus relay dots. Drawing segment by segment
-  // (rather than one polyline through every node) means a hop whose endpoint has no
-  // GPS simply breaks the line there instead of drawing a misleading straight chord
-  // across it. Relay dots mark the intermediate nodes only — the endpoints already
-  // carry the selection halo and the hover ring.
-  function setRouteLine(r) {
-    if (!ready || !map.getSource('route')) return;
-    const nodes = r?.found ? r.nodes ?? [] : [];
-    const features = [];
-    for (let i = 0; i < nodes.length - 1; i++) {
-      const a = nodes[i];
-      const b = nodes[i + 1];
-      if (
-        Number.isFinite(a?.lon) && Number.isFinite(a?.lat) &&
-        Number.isFinite(b?.lon) && Number.isFinite(b?.lat)
-      ) {
-        features.push({
-          type: 'Feature',
-          geometry: { type: 'LineString', coordinates: [[a.lon, a.lat], [b.lon, b.lat]] },
-          properties: {}
-        });
-      }
+    } else {
+      setLinkLines(hoverPk, hoverLinks);
     }
-    for (let i = 1; i < nodes.length - 1; i++) {
-      const n = nodes[i];
-      if (Number.isFinite(n?.lon) && Number.isFinite(n?.lat)) {
-        features.push({
-          type: 'Feature',
-          geometry: { type: 'Point', coordinates: [n.lon, n.lat] },
-          properties: {}
-        });
-      }
-    }
-    map.getSource('route').setData({ type: 'FeatureCollection', features });
-  }
-
-  // --- live advert pulses -----------------------------------------------------
-  // Realtime adverts arrive over a WebSocket (see liveAdverts in api.js). Each one
-  // drops a short-lived expanding ring + bright core at the node's location. The
-  // pulses live in a plain array animated by one rAF loop that only runs while
-  // something is pulsing and feeds a single reusable GeoJSON source — so at rest
-  // this costs nothing, and a burst of adverts is just a few features per frame.
-  let liveStop; // disposer returned by liveAdverts()
-  let pulses = []; // { lon, lat, color, start } active pulses
-  let pulseRaf = 0;
-  const PULSE_MS = 2200;
-  const MAX_PULSES = 80; // hard cap so a flood can't grow the array unbounded
-
-  function ensureLive() {
-    if (map.getSource('live-adverts')) return;
-    map.addSource('live-adverts', { type: 'geojson', data: EMPTY });
-    // Expanding hollow ring.
-    map.addLayer({
-      id: 'live-pulse-ring',
-      type: 'circle',
-      source: 'live-adverts',
-      paint: {
-        'circle-radius': ['get', 'radius'],
-        'circle-color': ['get', 'color'],
-        'circle-opacity': 0,
-        'circle-stroke-color': ['get', 'color'],
-        'circle-stroke-width': 2,
-        'circle-stroke-opacity': ['get', 'opacity']
-      }
-    });
-    // Bright core that fades fast, marking the node itself.
-    map.addLayer({
-      id: 'live-pulse-core',
-      type: 'circle',
-      source: 'live-adverts',
-      paint: {
-        'circle-radius': 5,
-        'circle-color': ['get', 'color'],
-        'circle-opacity': ['get', 'coreOpacity'],
-        'circle-stroke-color': '#fff',
-        'circle-stroke-width': 1,
-        'circle-stroke-opacity': ['*', ['get', 'coreOpacity'], 0.7]
-      }
-    });
-  }
-
-  function tickPulses() {
-    pulseRaf = 0;
-    if (!ready || !map.getSource('live-adverts')) {
-      pulses = [];
-      return;
-    }
-    const now = performance.now();
-    const features = [];
-    const next = [];
-    for (const p of pulses) {
-      const t = (now - p.start) / PULSE_MS;
-      if (t >= 1) continue;
-      next.push(p);
-      features.push({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: [p.lon, p.lat] },
-        properties: {
-          color: p.color,
-          radius: 5 + t * 24, // grow 5 -> 29 px
-          opacity: (1 - t) * 0.75, // ring fades out over its life
-          coreOpacity: Math.max(0, 1 - t * 2.2) * 0.9 // core fades in the first ~45%
-        }
-      });
-    }
-    pulses = next;
-    map.getSource('live-adverts').setData({ type: 'FeatureCollection', features });
-    if (pulses.length) pulseRaf = requestAnimationFrame(tickPulses);
-  }
-
-  // Drop a pulse for one advert, resolving its location from the advert's own GPS
-  // or, failing that, the node's last known position in the loaded set.
-  function addPulse(adv) {
-    if (!live || !ready) return;
-    let lon = adv.hasGps ? adv.lon : undefined;
-    let lat = adv.hasGps ? adv.lat : undefined;
-    if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
-      const n = byPubkey.get(adv.pubkey);
-      if (n && Number.isFinite(n.lon) && Number.isFinite(n.lat)) {
-        lon = n.lon;
-        lat = n.lat;
-      }
-    }
-    if (!Number.isFinite(lon) || !Number.isFinite(lat)) return; // can't place it
-    if (pulses.length >= MAX_PULSES) pulses.shift(); // drop the oldest
-    pulses.push({ lon, lat, color: TYPE_COLOR[adv.type] ?? DEFAULT_COLOR, start: performance.now() });
-    if (!pulseRaf) pulseRaf = requestAnimationFrame(tickPulses);
-  }
-
-  function startLive() {
-    if (liveStop || !live) return;
-    liveStop = liveAdverts(addPulse, { onStatus: (open) => onlive(open) });
-  }
-
-  function stopLive() {
-    liveStop?.();
-    liveStop = undefined;
-    onlive(false);
-    pulses = [];
-    cancelAnimationFrame(pulseRaf);
-    pulseRaf = 0;
-    if (map?.getSource('live-adverts')) map.getSource('live-adverts').setData(EMPTY);
   }
 
   function stopHoverPreview(clearLines = false) {
@@ -543,14 +472,32 @@
   function onHoverNode(pk) {
     if (pk === hoverPk) return;
     hoverPk = pk;
-    onhover(pk, pk ? byPubkey.get(pk) ?? null : null); // parent routes selected → here
     scheduleHoverPreview(pk);
   }
 
   function renderHoverTooltip(pk, node) {
     if (pk === renderedHoverPk) return;
     renderedHoverPk = pk;
-    hoverLabelText.textContent = node.name || 'Unnamed node';
+    // First line: node-type icon (coloured by type, matching the map dots)
+    // followed by the name.
+    hoverLabelText.replaceChildren();
+    const icon = TYPE_ICON[node.type];
+    if (icon) {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('viewBox', '0 0 24 24');
+      svg.setAttribute('fill', 'none');
+      svg.setAttribute('stroke', 'currentColor');
+      svg.setAttribute('stroke-width', '2');
+      svg.setAttribute('stroke-linecap', 'round');
+      svg.setAttribute('stroke-linejoin', 'round');
+      svg.setAttribute('class', 'hover-label-icon');
+      svg.style.color = TYPE_COLOR[node.type] ?? DEFAULT_COLOR;
+      svg.innerHTML = icon; // trusted markup from filters.js
+      hoverLabelText.append(svg);
+    }
+    const name = document.createElement('span');
+    name.textContent = node.name || 'Unnamed node';
+    hoverLabelText.append(name);
     hoverLabelNetworks.replaceChildren();
     for (const net of node.networks ?? []) {
       const item = document.createElement('span');
@@ -635,8 +582,9 @@
         'circle-sort-key': ['case', ['==', ['get', 'imported'], true], 0, 1]
       },
       paint: {
-        // Externally-mirrored (map.meshcore.io) nodes render grey; live nodes by type.
-        'circle-color': ['case', ['==', ['get', 'imported'], true], DEFAULT_COLOR, typeColorExpr],
+        // Externally-mirrored (map.meshcore.io) nodes render grey; live nodes by
+        // type. Swapped for band colouring by the colorByBand $effect.
+        'circle-color': colorByBand ? bandCircleColor(bandsCatalog) : typeCircleColor,
         'circle-radius': ['interpolate', ['linear'], ['zoom'], 4, 3.5, 12, 7],
         'circle-stroke-color': '#0d1117',
         'circle-stroke-width': 1
@@ -703,6 +651,7 @@
         { ...f.properties, lon: f.geometry.coordinates[0], lat: f.geometry.coordinates[1] }
       ])
     );
+    featuresVersion++; // byPubkey isn't reactive; bump so effects tracking it re-run
     if (ready) applyFilter(true);
   }
 
@@ -731,11 +680,101 @@
     lastQ = filters.q;
   }
 
+  // Focus mode: when a network is opened, show only its member nodes; when a
+  // node is opened, show only it and its link neighbours. Implemented as a
+  // layer-level MapLibre filter (not a source rebuild) so it's instant over the
+  // whole node set — filtered-out dots also stop being hoverable/clickable.
+  function applyNodeFocus() {
+    if (!ready || !map?.getLayer('nodes')) return;
+    const base = ['!', ['has', 'point_count']];
+    let focus = null;
+    if (emphasizedNet) {
+      // Include the network plus any subnetworks, since a parent network (e.g.
+      // "australia") often has no directly-tagged nodes — they live in its
+      // subregions ("australia-qld", …).
+      const ids = networkMemberIds.length ? networkMemberIds : [emphasizedNet];
+      focus = ['any', ...ids.map((id) => ['in', id, ['get', 'networks']])];
+    } else if (selected && !linksLoading) {
+      const set = [selected, ...(links ?? []).map((l) => l.neighbor?.pubkey).filter(Boolean)];
+      focus = ['in', ['get', 'pubkey'], ['literal', set]];
+    }
+    map.setFilter('nodes', focus ? ['all', base, focus] : base);
+  }
+
+  // Zoom by a whole step (used by the +/- keyboard shortcuts on the page).
+  export function zoomBy(delta) {
+    if (map) map.easeTo({ zoom: map.getZoom() + delta, duration: 200 });
+  }
+
   function fitToFeatures(features) {
     const b = new maplibregl.LngLatBounds();
     for (const f of features) b.extend(f.geometry.coordinates);
     if (!b.isEmpty()) map.fitBounds(b, { padding: 120, maxZoom: 12, duration: 600 });
   }
+
+  // A node the caller opened (from search or a restored URL) that should be
+  // framed together with all of its observed links once they finish loading.
+  let openTarget = $state('');
+  // Bumped whenever the node set (byPubkey) is replaced, so effects that read
+  // the non-reactive byPubkey map re-run once the full world set has loaded.
+  let featuresVersion = $state(0);
+
+  // Open a node and, once its links have loaded, zoom so the node and every
+  // drawable link neighbour are in view (see the openTarget effect below). Pan
+  // to the node right away (keeping the current zoom) for immediate feedback;
+  // the link fit then adjusts the zoom, avoiding a zoom-in-then-out jump.
+  export function openWithLinks(pk) {
+    openTarget = pk;
+    const f = byPubkey.get(pk);
+    if (map && f && Number.isFinite(f.lon) && Number.isFinite(f.lat)) {
+      map.panTo([f.lon, f.lat], { duration: 400 });
+    }
+  }
+
+  // Fit the camera to a node plus its link neighbours. Falls back to a plain
+  // centre when only the node itself is placeable (no drawable links).
+  function fitToLinks(pk) {
+    if (!map) return;
+    const origin = byPubkey.get(pk);
+    const b = new maplibregl.LngLatBounds();
+    let placed = 0;
+    if (origin && Number.isFinite(origin.lon) && Number.isFinite(origin.lat)) {
+      b.extend([origin.lon, origin.lat]);
+      placed++;
+    }
+    for (const l of links ?? []) {
+      const nb = l.neighbor;
+      if (nb?.hasGps && Number.isFinite(nb.lon) && Number.isFinite(nb.lat)) {
+        b.extend([nb.lon, nb.lat]);
+        placed++;
+      }
+    }
+    if (b.isEmpty()) return;
+    if (placed === 1) {
+      map.flyTo({ center: b.getCenter(), zoom: Math.max(map.getZoom(), 12), duration: 700 });
+      return;
+    }
+    // Leave room for the detail panel: on the right on wide screens, along the
+    // bottom on narrow ones (where it docks to the bottom sheet).
+    const wide = map.getContainer().clientWidth >= 640;
+    const padding = wide
+      ? { top: 90, right: 360, bottom: 90, left: 90 }
+      : { top: 90, right: 60, bottom: 320, left: 60 };
+    map.fitBounds(b, { padding, maxZoom: 14, duration: 800 });
+  }
+
+  // Once the opened node exists on the map and its links have finished loading,
+  // frame them all, then clear the target so later selections aren't reframed.
+  $effect(() => {
+    const target = openTarget;
+    const loading = linksLoading;
+    links; // track so a fresh link set re-runs this
+    featuresVersion; // track so a late full-node load re-runs this
+    if (!ready || !target || loading || selected !== target) return;
+    if (!byPubkey.get(target)) return; // node not on the map yet — wait
+    openTarget = '';
+    fitToLinks(target);
+  });
 
   function flyToSelected() {
     if (!focusSel) return;
@@ -830,13 +869,11 @@
   // --- (re)build everything after style load -------------------------------
   function addAll() {
     ensureLinks();
-    ensureRoute();
     ensureNodes();
     if (areasData) ensureAreas();
-    ensureLive();
-    restackLayers(); // enforce links + pulses above the node dots
+    restackLayers();
     buildLinkFeatures();
-    setRouteLine(route);
+    applyNodeFocus();
   }
 
   // Switch between the 3D globe and flat mercator projections. Projection is part
@@ -868,11 +905,25 @@
     });
     // Hover preview: highlight + name label + link lines for the node under the
     // cursor. mousemove tracks moving between overlapping dots.
-    map.on('mousemove', 'nodes', (e) => onHoverNode(e.features[0]?.properties.pubkey ?? ''));
-    map.on('mouseleave', 'nodes', () => onHoverNode(''));
-    // Clicking a link line focuses the neighbor at its far end.
+    map.on('mousemove', 'nodes', (e) => {
+      const pk = e.features[0]?.properties.pubkey ?? '';
+      onHoverNode(pk);
+      // While a node is selected, hovering one of its neighbour dots highlights
+      // that link line and its row in the detail panel (same as hovering the row).
+      if (selected) onhoverlink(pk);
+    });
+    map.on('mouseleave', 'nodes', () => {
+      onHoverNode('');
+      if (selected) onhoverlink('');
+    });
+    // Hovering a link line highlights it just like hovering its row in the
+    // detail panel (both drive `hoveredNeighbor` → the node-links-hover layer).
     map.on('mouseenter', 'node-links', pointer(true));
-    map.on('mouseleave', 'node-links', pointer(false));
+    map.on('mousemove', 'node-links', (e) => onhoverlink(e.features[0]?.properties?.neighbor ?? ''));
+    map.on('mouseleave', 'node-links', () => {
+      pointer(false)();
+      onhoverlink('');
+    });
     map.on('click', 'node-links', (e) => {
       // Lines terminate beneath node dots and can have a generous rendered
       // hitbox. Give the node (plus a small safety margin) priority so a click
@@ -905,16 +956,30 @@
       zoom: view.z,
       minZoom: 1,
       maxZoom: 18,
-      attributionControl: false
+      attributionControl: false,
+      projection: { type: globe ? 'globe' : 'mercator' }
     });
-    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-right');
+    // Bottom-right stack, top → bottom: compass, geolocate, zoom +/−. In a
+    // bottom corner, controls added later render above earlier ones, so the
+    // compass is added last to sit at the top. The compass doubles as the
+    // rotation/pitch reset — click it to snap back to north-up.
+    map.addControl(new maplibregl.NavigationControl({ showZoom: true, showCompass: false }), 'bottom-right');
     map.addControl(new maplibregl.GeolocateControl({ trackUserLocation: false }), 'bottom-right');
+    map.addControl(new maplibregl.NavigationControl({ showZoom: false, showCompass: true, visualizePitch: true }), 'bottom-right');
+    // Distance scale, sitting just above the layer switch in the bottom-left.
+    map.addControl(new maplibregl.ScaleControl({ maxWidth: 120, unit: 'metric' }), 'bottom-left');
     // Attribution is rendered by the page (next to the layer switch) so it can be
     // styled to match the UI; see the bottom-left controls in +page.svelte.
 
     if (typeof window !== 'undefined') window.__map = map;
     focusSel = selected || '';
+    // A URL-restored selection should also frame its links once they load.
+    openTarget = selected || '';
     map.on('moveend', () => {
+      // Ignore stray move events fired during construction (before the style is
+      // ready the center can read as 0,0), which would otherwise clobber the
+      // seeded default position in the URL with z=0&lat=0&lon=0.
+      if (!ready) return;
       const c = map.getCenter();
       onmove({ z: map.getZoom(), lat: c.lat, lon: c.lng });
     });
@@ -948,7 +1013,6 @@
     map.on('load', async () => {
       addAll();
       wireInteractions();
-      applyProjection();
       ready = true;
       applyFilter(true); // render whatever (viewport) data has arrived so far
       await dataReady;
@@ -964,7 +1028,6 @@
 
   onDestroy(() => {
     stopHoverPreview();
-    stopLive();
     map?.remove();
   });
 
@@ -991,19 +1054,34 @@
     filters.net;
     selected;
     hoverPk;
+    emphasizedNet;
+    emphasizedAreaIds;
     if (!ready) return;
-    // Selection and hover both frame coverage, so load area data on demand even
-    // when the persistent coverage toggle is off.
-    const want = showAreas || selectedNetworks().length > 0 || hoveredNetworks().length > 0;
+    // Selection, hover and an opened network all frame coverage, so load area
+    // data on demand even when the persistent coverage toggle is off.
+    const want =
+      showAreas ||
+      selectedNetworks().length > 0 ||
+      hoveredNetworks().length > 0 ||
+      !!emphasizedNet;
+    const done = () => {
+      ensureAreas();
+      updateAreas();
+      // Zoom to an opened network once, when it becomes emphasised.
+      if (emphasizedNet && emphasizedNet !== lastEmphFit && areasData) {
+        lastEmphFit = emphasizedNet;
+        fitToNetwork(emphasizedNet);
+      } else if (!emphasizedNet) {
+        lastEmphFit = '';
+      }
+    };
     if (want && !areasData) {
       networkAreas().then((d) => {
         areasData = colorizeAreas(d);
-        ensureAreas();
-        updateAreas();
+        done();
       });
     } else {
-      ensureAreas();
-      updateAreas();
+      done();
     }
   });
 
@@ -1067,19 +1145,15 @@
     if (ready) buildLinkFeatures();
   });
 
-  // Redraw the computed route whenever the parent supplies a new one (or clears it
-  // to null on deselect / when the cursor leaves a target node).
+  // Re-apply focus (which nodes are visible) when the opened node/network or the
+  // selected node's links change.
   $effect(() => {
-    const r = route;
-    if (ready) setRouteLine(r);
-  });
-
-  // Open or close the live advert feed as the toggle changes. untrack so the
-  // start/stop helpers (which touch non-reactive map state) don't re-run this.
-  $effect(() => {
-    live;
-    if (!ready) return;
-    untrack(() => (live ? startLive() : stopLive()));
+    selected;
+    links;
+    linksLoading;
+    emphasizedNet;
+    networkMemberIds;
+    if (ready) applyNodeFocus();
   });
 
   // Highlight the link line the panel is hovering. Read the reactive value first
@@ -1168,7 +1242,15 @@
     border: 1px solid var(--color-edge);
   }
   .hover-label-name {
-    display: block;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+  }
+  :global(.hover-label-icon) {
+    width: 13px;
+    height: 13px;
+    flex: none;
   }
   .hover-networks {
     display: flex;

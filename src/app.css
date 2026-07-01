@@ -78,39 +78,102 @@
   }
 }
 
-/* MapLibre's controls inherit our theme tokens rather than its stock white
-   chrome, and are enlarged to match the app's other touch targets, so the map
-   reads as part of the same UI in both modes. (Attribution is rendered by the
-   page next to the layer switch, not by MapLibre.) */
-.maplibregl-ctrl-group {
+/* MapLibre controls (bottom-right zoom + geolocate) styled to match the app's
+   other floating glass-card buttons: each button is its own 38px rounded card,
+   the group container is transparent, and cards sit 8px apart with a 12px gap
+   from the map edge. maplibre-gl.css is imported inside MapView and therefore
+   loads AFTER this file, so these overrides need !important (or higher
+   specificity) to win — otherwise the default control positioning/borders leak
+   back in (collapsed bottom gap, doubled border). */
+.maplibregl-ctrl-bottom-right {
+  bottom: 12px !important;
+  right: 12px !important;
+}
+.maplibregl-ctrl-bottom-right .maplibregl-ctrl {
+  margin: 0 0 8px !important;
+}
+.maplibregl-ctrl-bottom-right .maplibregl-ctrl:last-child {
+  margin-bottom: 0 !important;
+}
+html .maplibregl-ctrl-group {
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  overflow: visible !important;
+  backdrop-filter: none !important;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+html .maplibregl-ctrl-group button {
+  display: grid;
+  place-items: center;
+  width: 38px !important;
+  height: 38px !important;
+  border-radius: 0.75rem !important;
+  border: 1px solid var(--color-edge) !important;
+  background: color-mix(in srgb, var(--color-elev) 90%, transparent) !important;
+  backdrop-filter: blur(8px);
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 0.14),
+    0 5px 16px rgb(0 0 0 / 0.12) !important;
+  color: var(--color-dim);
+  transition: background 0.15s, color 0.15s;
+}
+:root[data-theme='light'] html .maplibregl-ctrl-group button {
+  box-shadow:
+    0 1px 2px rgb(31 35 40 / 0.10),
+    0 6px 18px rgb(31 35 40 / 0.09) !important;
+}
+html .maplibregl-ctrl-group button:not(:disabled):hover {
+  background: var(--color-elev2) !important;
+  color: var(--color-ink);
+}
+html .maplibregl-ctrl button .maplibregl-ctrl-icon {
+  transform: scale(1.15);
+}
+:root[data-theme='dark'] html .maplibregl-ctrl button .maplibregl-ctrl-icon {
+  filter: invert(1);
+}
+
+/* MapLibre makes its canvas focusable (tabindex=0), so clicking or tabbing to
+   the map draws the browser's default focus ring around the whole viewport.
+   Suppress it — the map has no keyboard focus affordance we need to surface. */
+.maplibregl-canvas:focus,
+.maplibregl-canvas:focus-visible,
+.maplibregl-map:focus,
+.maplibregl-map:focus-visible {
+  outline: none !important;
+}
+
+/* Distance scale (bottom-left) sits just above the layer switch / attribution
+   row (38px control + 12px edge gap + 8px spacing). Themed to match the app's
+   glass surfaces while keeping the ruler's width = distance semantics. */
+.maplibregl-ctrl-bottom-left {
+  bottom: 58px !important;
+  left: 12px !important;
+}
+.maplibregl-ctrl-bottom-left .maplibregl-ctrl {
+  margin: 0 !important;
+}
+html .maplibregl-ctrl-scale {
   background: color-mix(in srgb, var(--color-elev) 90%, transparent);
-  border: 1px solid var(--color-edge);
-  border-radius: 0.75rem;
+  backdrop-filter: blur(8px);
+  border: 2px solid var(--color-edge);
+  border-top: none;
+  border-radius: 0 0 6px 6px;
   box-shadow:
     0 1px 2px rgb(0 0 0 / 0.14),
     0 5px 16px rgb(0 0 0 / 0.12);
-  overflow: hidden;
-  backdrop-filter: blur(8px);
+  color: var(--color-ink);
+  font-size: 0.66rem;
+  font-weight: 600;
+  line-height: 1.35;
+  padding: 0 5px 2px;
 }
-:root[data-theme='light'] .maplibregl-ctrl-group {
+:root[data-theme='light'] html .maplibregl-ctrl-scale {
   box-shadow:
     0 1px 2px rgb(31 35 40 / 0.10),
     0 6px 18px rgb(31 35 40 / 0.09);
-}
-.maplibregl-ctrl-group button {
-  width: 38px;
-  height: 38px;
-}
-.maplibregl-ctrl-group button + button {
-  border-top: 1px solid var(--color-edge);
-}
-.maplibregl-ctrl-group button:hover {
-  background: var(--color-elev2);
-}
-.maplibregl-ctrl button .maplibregl-ctrl-icon {
-  filter: var(--mlbl-icon-filter, none);
-  transform: scale(1.15);
-}
-:root[data-theme='dark'] .maplibregl-ctrl button .maplibregl-ctrl-icon {
-  filter: invert(1);
 }
