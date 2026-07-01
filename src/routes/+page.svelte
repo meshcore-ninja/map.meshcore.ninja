@@ -70,6 +70,7 @@
   let paletteNodes = $state([]);
   let networksCatalog = $state({});
   let bandsCatalog = $state({});
+  let hoveredAreaNet = $state(null);
   let mapView; // component ref, for openWithLinks
   const isMac =
     typeof navigator !== 'undefined' &&
@@ -150,8 +151,16 @@
     mapView?.openWithLinks(node.pubkey);
   }
 
+  function openLocation(location) {
+    onSelect(null);
+    selectedNetwork = null;
+    previewNet = '';
+    mapView?.flyToLocation(location);
+  }
+
   // --- observed links for the selected node ---
   let links = $state([]);
+  let linksFor = $state('');
   let linksMeta = $state({ total: 0, capped: false });
   let linksLoading = $state(false);
   let linksError = $state(false);
@@ -166,6 +175,7 @@
     linkCtl?.abort();
     if (!pk || imported) {
       links = [];
+      linksFor = '';
       linksMeta = { total: 0, capped: false };
       linksLoading = false;
       linksError = false;
@@ -176,18 +186,21 @@
     // redraw stale lines fanning from the new origin to the old neighbours
     // while the new set loads.
     links = [];
+    linksFor = '';
     linksMeta = { total: 0, capped: false };
     linksLoading = true;
     linksError = false;
     nodeLinks(pk, { net, active, limit: 200 }, linkCtl.signal)
       .then((d) => {
         links = d.links ?? [];
+        linksFor = pk;
         linksMeta = { total: d.total ?? links.length, capped: !!d.capped };
         linksLoading = false;
       })
       .catch((e) => {
         if (e?.name === 'AbortError') return;
         links = [];
+        linksFor = '';
         linksMeta = { total: 0, capped: false };
         linksError = true;
         linksLoading = false;
@@ -207,6 +220,7 @@
       lastAdvertAt: l.lastSeen,
       networks: l.networks ?? []
     });
+    mapView?.openWithLinks(n.pubkey);
   }
 
   onMount(async () => {
@@ -220,6 +234,7 @@
       return;
     }
     selectedNetwork = null; // selecting a node closes any open network detail
+    hoveredAreaNet = null;
     selectedNode = { ...props, networks: Array.isArray(props.networks) ? props.networks : [] };
     selected = selectedNode.pubkey;
   }
@@ -283,7 +298,8 @@
     selectedNetwork ? bandBadge(String(selectedNetwork.radio?.frequency ?? ''), bandsCatalog) : null
   );
   // Which networks' nodes count as belonging to the opened network. Always the
-  // network itself plus any id-prefixed subnetworks. A "general"-scope network is
+  // network itself plus explicit catalog subnetworks. Older catalog data used
+  // id-prefixed subnetworks, so keep that as a fallback. A "general"-scope network is
   // a country-wide radio preset (e.g. "australia") that usually has no directly-
   // tagged nodes — its nodes live in the regional community networks covering the
   // same country (eastmesh, victoria-mesh, …) — so we widen it to every network
@@ -292,8 +308,9 @@
     if (!selectedNetwork) return [];
     const id = selectedNetwork.id;
     const ids = new Set([id]);
+    for (const childId of selectedNetwork.subnetworks ?? []) ids.add(childId);
     for (const n of networksForPalette) {
-      if (n.id !== id && n.id.startsWith(`${id}-`)) ids.add(n.id);
+      if (n.id !== id && ((n.part_of ?? []).includes(id) || n.id.startsWith(`${id}-`))) ids.add(n.id);
     }
     if (selectedNetwork.scope === 'general') {
       const countries = new Set(selectedNetwork.coverage?.countries ?? []);
@@ -325,8 +342,8 @@
   // map focuses just that subnetwork's nodes (a preview) instead of the family.
   let previewNet = $state('');
 
-  // The member networks (excluding the opened one) that actually have nodes,
-  // listed in the detail panel and hoverable to preview just their nodes.
+  // The explicit member networks (excluding the opened one), listed in the
+  // detail panel and hoverable to preview just their nodes.
   let subnetworkList = $derived.by(() => {
     if (!selectedNetwork) return [];
     const fam = new Set(emphasizedFamily.filter((id) => id !== selectedNetwork.id));
@@ -335,17 +352,32 @@
     for (const n of paletteNodes) {
       for (const id of n.networks ?? []) if (fam.has(id)) counts[id] = (counts[id] ?? 0) + 1;
     }
-    return Object.keys(counts)
-      .map((id) => ({ id, net: networksCatalog[id], count: counts[id] }))
+    return [...fam]
+      .map((id) => ({ id, net: networksCatalog[id], count: counts[id] ?? 0 }))
       .filter((x) => x.net)
-      .sort((a, b) => b.count - a.count);
+      .sort((a, b) => b.count - a.count || (a.net.name ?? a.id).localeCompare(b.net.name ?? b.id));
   });
 
   function openNetwork(net) {
     onSelect(null); // networks and nodes are mutually exclusive in the panel
     previewNet = '';
-    selectedNetwork = net;
+    hoveredAreaNet = null;
+    selectedNetwork = networksCatalog[net.id] ?? net;
   }
+
+  function openNetworkId(id) {
+    const net = networksCatalog[id];
+    if (net) openNetwork(net);
+  }
+
+  function hoverArea(id) {
+    hoveredAreaNet = id ? networksCatalog[id] ?? null : null;
+  }
+
+  let areaPickIds = $derived(networksForPalette.map((net) => net.id));
+  let areaRanks = $derived(
+    Object.fromEntries(networksForPalette.map((net) => [net.id, net.areaKm2 ?? Number.POSITIVE_INFINITY]))
+  );
 </script>
 
 <MapView
@@ -366,10 +398,15 @@
   {globe}
   {selected}
   {links}
+  {linksFor}
   {linksLoading}
   {networkNames}
+  {areaPickIds}
+  {areaRanks}
   {hoveredNeighbor}
   onselect={onSelect}
+  onselectnetwork={openNetworkId}
+  onhoverarea={hoverArea}
   onmove={(v) => { view = v; if (!attribManual) attribVisible = false; }}
   onstatus={(s) => (status = s)}
   onready={() => (appReady = true)}
@@ -666,6 +703,24 @@
   </div>
 </header>
 
+{#if hoveredAreaNet}
+  <div class="pointer-events-none absolute left-1/2 top-3 z-20 hidden -translate-x-1/2 sm:block">
+    <div class="map-float flex max-w-[28rem] items-center gap-2 rounded-xl border border-accent2/40 bg-elev/90 px-3 py-2 text-[0.82rem] backdrop-blur">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-4 w-4 shrink-0 text-accent2" aria-hidden="true">
+        <circle cx="12" cy="12" r="9" /><path d="M12 3a15 15 0 0 1 0 18M3 12h18" stroke-linecap="round" />
+      </svg>
+      <span class="min-w-0 truncate font-medium text-ink">{hoveredAreaNet.short_name || hoveredAreaNet.name || hoveredAreaNet.id}</span>
+      {#if (hoveredAreaNet.coverage?.countries ?? []).length}
+        <span class="flex shrink-0 items-center gap-1">
+          {#each hoveredAreaNet.coverage.countries.slice(0, 3) as cc}
+            <Flag code={cc} class="h-3 w-4 rounded-sm opacity-80" />
+          {/each}
+        </span>
+      {/if}
+    </div>
+  </div>
+{/if}
+
 <!-- ⌘K / Ctrl+K node search -->
 <CommandPalette
   bind:open={paletteOpen}
@@ -676,6 +731,7 @@
   {isMac}
   onselect={openNode}
   onselectNetwork={openNetwork}
+  onselectLocation={openLocation}
 />
 
 <!-- Basemap / layer chooser + attribution (bottom-left) -->
@@ -837,6 +893,36 @@
       </div>
     </dl>
 
+    <!-- Zoom levels: local (the node), neighbours (node + all its links),
+         network (the whole coverage shape of the node's network). -->
+    <div class="mt-4 grid grid-cols-3 gap-1.5">
+      <button
+        onclick={() => mapView?.focusNodeLocal(selectedNode.pubkey)}
+        title="Local — zoom to this node"
+        aria-label="Local — zoom to this node"
+        class="flex items-center justify-center rounded-lg border border-edge bg-bg/60 py-2 text-dim transition hover:border-accent hover:text-ink"
+      >
+        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8" /><path d="M12 2v3M12 19v3M2 12h3M19 12h3" /><circle cx="12" cy="12" r="2.5" /></svg>
+      </button>
+      <button
+        onclick={() => mapView?.focusNodeNeighbors(selectedNode.pubkey)}
+        title="Neighbours — zoom to all links"
+        aria-label="Neighbours — zoom to all links"
+        class="flex items-center justify-center rounded-lg border border-edge bg-bg/60 py-2 text-dim transition hover:border-accent hover:text-ink"
+      >
+        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="2.5" /><circle cx="6" cy="12" r="2.5" /><circle cx="18" cy="19" r="2.5" /><path d="M8.3 10.7 15.7 6.3M8.3 13.3 15.7 17.7" /></svg>
+      </button>
+      <button
+        onclick={() => mapView?.focusNetwork(selectedNode.networks?.[0], true)}
+        disabled={!selectedNode.networks?.length}
+        title="Network — zoom to the network"
+        aria-label="Network — zoom to the network"
+        class="flex items-center justify-center rounded-lg border border-edge bg-bg/60 py-2 text-dim transition hover:border-accent hover:text-ink disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-edge disabled:hover:text-dim"
+      >
+        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M3 12h18" /><path d="M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18" /></svg>
+      </button>
+    </div>
+
     <!-- Observed links to neighboring nodes -->
     <div class="mt-4 border-t border-edge pt-3">
       <div class="mb-2 flex items-center justify-between">
@@ -985,12 +1071,18 @@
     {#if subnetworkList.length}
       <div class="mt-4 border-t border-edge pt-3">
         <div class="mb-2 text-[0.7rem] font-semibold uppercase tracking-wide text-dim">Sub-networks</div>
-        <ul class="flex flex-col gap-1">
+        <!-- No real gap between rows: the visual spacing is padding *inside* each
+             <li> so there is no dead zone between hover targets. Moving the mouse
+             from one row to the next never lands on empty space, so previewNet
+             never blinks back to '' and the map stops flickering. -->
+        <ul class="flex flex-col">
           {#each subnetworkList as s (s.id)}
-            <li>
+            <li
+              onmouseenter={() => (previewNet = s.id)}
+              onmouseleave={() => { if (previewNet === s.id) previewNet = ''; }}
+              class="py-0.5"
+            >
               <button
-                onmouseenter={() => (previewNet = s.id)}
-                onmouseleave={() => { if (previewNet === s.id) previewNet = ''; }}
                 onclick={() => openNetwork(s.net)}
                 class="flex w-full items-center justify-between gap-2 rounded-lg border border-edge bg-bg/60 px-2.5 py-1.5 text-left transition hover:border-accent hover:bg-elev2"
               >
@@ -1008,7 +1100,27 @@
       </div>
     {/if}
 
-    <div class="mt-4 flex flex-wrap gap-2 border-t border-edge pt-3">
+    <!-- Zoom levels: the coverage shape alone, or the shape plus all its nodes. -->
+    <div class="mt-4 grid grid-cols-2 gap-1.5 border-t border-edge pt-3">
+      <button
+        onclick={() => mapView?.focusNetwork(selectedNetwork.id, false)}
+        title="Shape — zoom to the coverage shape"
+        aria-label="Shape — zoom to the coverage shape"
+        class="flex items-center justify-center rounded-lg border border-edge bg-bg/60 py-2 text-dim transition hover:border-accent hover:text-ink"
+      >
+        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 21 7.5v9L12 22 3 16.5v-9z" /></svg>
+      </button>
+      <button
+        onclick={() => mapView?.focusNetwork(selectedNetwork.id, true)}
+        title="Shape + nodes — zoom to the shape and all nodes"
+        aria-label="Shape + nodes — zoom to the shape and all nodes"
+        class="flex items-center justify-center rounded-lg border border-edge bg-bg/60 py-2 text-dim transition hover:border-accent hover:text-ink"
+      >
+        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 21 7.5v9L12 22 3 16.5v-9z" /><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" /><circle cx="8.5" cy="9.5" r="1.1" fill="currentColor" stroke="none" /><circle cx="15" cy="14.5" r="1.1" fill="currentColor" stroke="none" /></svg>
+      </button>
+    </div>
+
+    <div class="mt-3 flex flex-wrap gap-2 border-t border-edge pt-3">
       <a
         href={netUrl(selectedNetwork.id)}
         target="_blank"

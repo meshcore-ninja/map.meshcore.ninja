@@ -22,11 +22,16 @@
     globe = true, // 3D globe projection vs. flat mercator
     selected = '',
     links = [], // observed links for the selected node (from /api/nodes/{pk}/links)
+    linksFor = '', // pubkey that the selected-node links belong to
     linksLoading = false, // selected-node link request is in flight
     linkColor = '#c678dd', // configurable colour for the drawn link lines
     networkNames = {}, // network id -> short display name
+    areaPickIds = [], // network area ids that can be hovered/clicked
+    areaRanks = {}, // network id -> comparable area size, used to pick smallest overlap
     hoveredNeighbor = '', // pubkey of a link the panel is hovering, to highlight on the map
     onselect = () => {},
+    onselectnetwork = () => {},
+    onhoverarea = () => {},
     onmove = () => {},
     onstatus = () => {},
     onready = () => {},
@@ -59,10 +64,12 @@
   let areasData = null; // network-area FeatureCollection (lazy)
   let lastQ = '';
   let focusSel = '';
+  let hoverAreaId = $state('');
 
   const EMPTY = { type: 'FeatureCollection', features: [] };
   const NODE_LAYERS = ['clusters', 'cluster-count', 'node-hover', 'node-selected', 'nodes'];
   const LINK_LAYERS = ['node-links', 'node-links-hover'];
+  const AREA_LAYERS = ['area-hit', 'area-hover-line', 'area-line', 'area-fill'];
   const LAYER_STACK = [
     'clusters',
     'cluster-count',
@@ -164,13 +171,40 @@
   function ensureAreas() {
     if (!areasData || map.getSource('areas')) return;
     const beforeId = map.getLayer('clusters') ? 'clusters' : map.getLayer('nodes') ? 'nodes' : undefined;
-    map.addSource('areas', { type: 'geojson', data: areasData });
+    map.addSource('areas', { type: 'geojson', data: areasData, promoteId: 'networkId' });
+    // Always-on base outline: every network's coverage drawn as a faint, thin grey
+    // stroke so the whole mesh landscape is visible by default. The colourful
+    // per-network layers (emphasis / selection / hover) draw on top of this.
+    map.addLayer(
+      {
+        id: 'area-base-line',
+        type: 'line',
+        source: 'areas',
+        paint: {
+          'line-color': '#8f9aa6',
+          'line-opacity': 0.4,
+          'line-width': 1.5,
+          'line-blur': 0.4,
+          'line-dasharray': [3, 2]
+        }
+      },
+      beforeId
+    );
+    map.addLayer(
+      {
+        id: 'area-hit',
+        type: 'fill',
+        source: 'areas',
+        paint: { 'fill-color': '#000000', 'fill-opacity': 0.001 }
+      },
+      beforeId
+    );
     map.addLayer(
       {
         id: 'area-fill',
         type: 'fill',
         source: 'areas',
-        paint: { 'fill-color': ['get', 'networkColor'], 'fill-opacity': 0.08 }
+        paint: { 'fill-color': ['get', 'networkColor'], 'fill-opacity': 0 }
       },
       beforeId
     );
@@ -181,14 +215,29 @@
         source: 'areas',
         paint: {
           'line-color': ['get', 'networkColor'],
-          'line-opacity': 0.95,
-          'line-width': 6,
+          'line-opacity': 0,
+          'line-width': 4,
+          'line-blur': 0.8
+        }
+      },
+      beforeId
+    );
+    map.addLayer(
+      {
+        id: 'area-hover-line',
+        type: 'line',
+        source: 'areas',
+        paint: {
+          'line-color': '#8f9aa6',
+          'line-opacity': ['case', ['boolean', ['feature-state', 'hover'], false], 0.62, 0],
+          'line-width': 4,
           'line-blur': 0.8
         }
       },
       beforeId
     );
     updateAreas();
+    if (hoverAreaId) setHoverArea(hoverAreaId, true);
   }
   // Networks associated with the selected or hovered node, used to frame their
   // coverage without changing the visibility of any other map nodes.
@@ -207,62 +256,136 @@
   function updateAreas() {
     if (!map.getLayer('area-fill')) return;
 
+    const idsOpacity = (ids, opacity) =>
+      ids.length ? ['case', ['in', ['get', 'networkId'], ['literal', ids]], opacity, 0] : 0;
+
     // An explicitly opened network (from search) wins: frame only it, with a
     // bolder border and a faint fill so it reads as emphasised.
     if (emphasizedNet) {
       // Show the coverage borders of the whole family (the network plus its
       // subnetworks), so the subregion shapes are visible, not just the parent.
       const ids = emphasizedAreaIds.length ? emphasizedAreaIds : [emphasizedNet];
-      const filter = ['in', ['get', 'networkId'], ['literal', ids]];
       for (const id of ['area-fill', 'area-line']) {
         map.setLayoutProperty(id, 'visibility', 'visible');
-        map.setFilter(id, filter);
       }
-      map.setPaintProperty('area-fill', 'fill-opacity', 0.12);
+      map.setPaintProperty('area-fill', 'fill-opacity', idsOpacity(ids, 0.12));
       map.setPaintProperty('area-line', 'line-width', 5);
-      map.setPaintProperty('area-line', 'line-opacity', 1);
+      map.setPaintProperty('area-line', 'line-opacity', idsOpacity(ids, 1));
       map.setPaintProperty('area-line', 'line-blur', 0.4);
       return;
     }
 
     // Restore the default border styling (in case we were just emphasising one).
     map.setPaintProperty('area-line', 'line-width', 4);
-    map.setPaintProperty('area-line', 'line-opacity', 0.95);
     map.setPaintProperty('area-line', 'line-blur', 0.8);
 
     const selNets = selectedNetworks();
-    const hoverNets = hoveredNetworks();
+    const hoverNets = hoverAreaId ? [] : hoveredNetworks();
     const framedNets = selNets.length ? selNets : hoverNets;
     // While a node is selected, frame its network area(s) even if the toggle is
     // off. Hovering previews only the border for that node's network(s).
-    const vis = showAreas || framedNets.length ? 'visible' : 'none';
-    let filter = null;
-    if (framedNets.length) filter = ['in', ['get', 'networkId'], ['literal', framedNets]];
-    else if (filters.net) filter = ['==', ['get', 'networkId'], filters.net];
     for (const id of ['area-fill', 'area-line']) {
-      map.setLayoutProperty(id, 'visibility', vis);
-      map.setFilter(id, filter);
+      map.setLayoutProperty(id, 'visibility', 'visible');
     }
     // Selection and hover use the same border-only treatment. The fill belongs
     // only to the explicit persistent coverage-area toggle.
     map.setPaintProperty('area-fill', 'fill-opacity', showAreas ? 0.08 : 0);
+    if (framedNets.length) {
+      map.setPaintProperty('area-line', 'line-opacity', idsOpacity(framedNets, 0.95));
+    } else if (filters.net) {
+      map.setPaintProperty('area-line', 'line-opacity', idsOpacity([filters.net], 0.95));
+    } else {
+      map.setPaintProperty('area-line', 'line-opacity', showAreas ? 0.95 : 0);
+    }
+  }
+
+  function setHoverArea(id, force = false) {
+    if (id === hoverAreaId && !force) {
+      onhoverarea(id);
+      return;
+    }
+    if (map?.getSource('areas') && hoverAreaId) {
+      map.setFeatureState({ source: 'areas', id: hoverAreaId }, { hover: false });
+    }
+    hoverAreaId = id;
+    if (map?.getSource('areas') && hoverAreaId) {
+      map.setFeatureState({ source: 'areas', id: hoverAreaId }, { hover: true });
+    }
+    onhoverarea(id);
+  }
+
+  function pickedAreaId(point) {
+    if (!map.getLayer('area-hit')) return '';
+    const hits = map.queryRenderedFeatures(point, { layers: ['area-hit'] });
+    let best = null;
+    for (const hit of hits) {
+      const id = hit.properties?.networkId ?? '';
+      if (!id || !(id in areaRanks)) continue;
+      const rank = areaRanks[id] ?? Number.POSITIVE_INFINITY;
+      if (!best || rank < best.rank) best = { id, rank };
+    }
+    return best?.id ?? '';
+  }
+
+  let areaHoverFrame = 0;
+  let lastAreaHoverPoint = null;
+  let lastAreaHoverAt = 0;
+  const AREA_HOVER_INTERVAL = 70;
+
+  function scheduleAreaHover(point) {
+    lastAreaHoverPoint = point;
+    if (areaHoverFrame) return;
+    areaHoverFrame = requestAnimationFrame(() => {
+      areaHoverFrame = 0;
+      if (!lastAreaHoverPoint || !map?.getLayer('area-hit')) return;
+      const now = performance.now();
+      if (now - lastAreaHoverAt < AREA_HOVER_INTERVAL) {
+        scheduleAreaHover(lastAreaHoverPoint);
+        return;
+      }
+      lastAreaHoverAt = now;
+      const id = pickedAreaId(lastAreaHoverPoint);
+      setHoverArea(id);
+      if (!id) map.getCanvas().style.cursor = '';
+      else map.getCanvas().style.cursor = 'pointer';
+    });
   }
 
   // Fit the camera to a network's coverage polygon(s). Leaves room for the detail
   // panel (right on wide screens, bottom on narrow ones).
   let lastEmphFit = '';
-  function fitToNetwork(netId) {
-    if (!map || !areasData) return;
+  // Fit the camera to a network. `includeNodes` widens the bounds to also cover
+  // every member node (some sit outside the drawn polygons); when false it frames
+  // just the coverage shape(s). Exported below as focusNetwork().
+  export function focusNetwork(netId, includeNodes = true) {
+    if (!map || !areasData || !netId) return;
     const b = new maplibregl.LngLatBounds();
     const extend = (coords) => {
       if (typeof coords[0] === 'number') b.extend(coords);
       else for (const c of coords) extend(c);
     };
     let any = false;
+    // The whole family's coverage polygon(s): a parent network (e.g. "australia")
+    // may itself have no shape, so include its subnetworks' shapes too.
+    const memberIds = new Set(
+      networkMemberIds.length && (emphasizedNet === netId || !emphasizedNet)
+        ? networkMemberIds
+        : [netId]
+    );
     for (const f of areasData.features ?? []) {
-      if (f.properties?.networkId !== netId || !f.geometry?.coordinates) continue;
+      if (!memberIds.has(f.properties?.networkId) || !f.geometry?.coordinates) continue;
       extend(f.geometry.coordinates);
       any = true;
+    }
+    // Also cover every member node, so the camera frames both the coverage area
+    // and all the nodes living in it (some sit outside the drawn polygons).
+    if (includeNodes) {
+      for (const n of byPubkey.values()) {
+        if (!Number.isFinite(n.lon) || !Number.isFinite(n.lat)) continue;
+        if (!n.networks?.some((id) => memberIds.has(id))) continue;
+        b.extend([n.lon, n.lat]);
+        any = true;
+      }
     }
     if (!any || b.isEmpty()) return;
     const wide = map.getContainer().clientWidth >= 640;
@@ -270,6 +393,20 @@
       ? { top: 90, right: 360, bottom: 90, left: 90 }
       : { top: 90, right: 60, bottom: 320, left: 60 };
     map.fitBounds(b, { padding, maxZoom: 12, duration: 800 });
+  }
+
+  // Local level: fly in tight on a single node's position.
+  export function focusNodeLocal(pk) {
+    const f = byPubkey.get(pk);
+    if (map && f && Number.isFinite(f.lon) && Number.isFinite(f.lat)) {
+      map.flyTo({ center: [f.lon, f.lat], zoom: 15, duration: 700 });
+    }
+  }
+
+  // Neighbours level: frame the node together with all its drawable link
+  // neighbours (relies on the selected node's links being loaded).
+  export function focusNodeNeighbors(pk) {
+    fitToLinks(pk);
   }
 
   // --- observed-link source + layers -----------------------------------------
@@ -389,7 +526,7 @@
   // selected) previews the hovered node's links fetched on the fly.
   function buildLinkFeatures() {
     if (selected) {
-      if (links.length) {
+      if (linksFor === selected && links.length) {
         setLinkLines(selected, links);
       } else if (shownLinkOrigin === selected && shownLinkCount > 0) {
         // Clicking a node whose links are already on screen (e.g. from the hover
@@ -398,7 +535,7 @@
         // them until the fetched set snaps in.
         return;
       } else {
-        setLinkLines(selected, links); // different node (or none): clear
+        setLinkLines(selected, []); // different node or still-loading link set: clear
       }
     } else {
       setLinkLines(hoverPk, hoverLinks);
@@ -447,7 +584,7 @@
         hoverProgress.classList.add('is-loading');
       }
       hoverCtl = new AbortController();
-      nodeLinks(pk, { net: filters.net, active: filters.active }, hoverCtl.signal)
+      nodeLinks(pk, { net: filters.net, active: filters.active, limit: 200 }, hoverCtl.signal)
         .then((d) => {
           if (hoverPk === pk && !selected) {
             hoverLinks = d.links ?? [];
@@ -695,7 +832,8 @@
       const ids = networkMemberIds.length ? networkMemberIds : [emphasizedNet];
       focus = ['any', ...ids.map((id) => ['in', id, ['get', 'networks']])];
     } else if (selected && !linksLoading) {
-      const set = [selected, ...(links ?? []).map((l) => l.neighbor?.pubkey).filter(Boolean)];
+      const linkSet = linksFor === selected ? links : [];
+      const set = [selected, ...(linkSet ?? []).map((l) => l.neighbor?.pubkey).filter(Boolean)];
       focus = ['in', ['get', 'pubkey'], ['literal', set]];
     }
     map.setFilter('nodes', focus ? ['all', base, focus] : base);
@@ -704,6 +842,11 @@
   // Zoom by a whole step (used by the +/- keyboard shortcuts on the page).
   export function zoomBy(delta) {
     if (map) map.easeTo({ zoom: map.getZoom() + delta, duration: 200 });
+  }
+
+  export function flyToLocation({ lon, lat, zoom = 12 } = {}) {
+    if (!map || !Number.isFinite(lon) || !Number.isFinite(lat)) return;
+    map.flyTo({ center: [lon, lat], zoom: Math.max(map.getZoom(), zoom), duration: 700 });
   }
 
   function fitToFeatures(features) {
@@ -727,7 +870,7 @@
     openTarget = pk;
     const f = byPubkey.get(pk);
     if (map && f && Number.isFinite(f.lon) && Number.isFinite(f.lat)) {
-      map.panTo([f.lon, f.lat], { duration: 400 });
+      map.flyTo({ center: [f.lon, f.lat], zoom: Math.max(map.getZoom(), 12), duration: 600 });
     }
   }
 
@@ -768,9 +911,10 @@
   $effect(() => {
     const target = openTarget;
     const loading = linksLoading;
+    const linkOrigin = linksFor;
     links; // track so a fresh link set re-runs this
     featuresVersion; // track so a late full-node load re-runs this
-    if (!ready || !target || loading || selected !== target) return;
+    if (!ready || !target || loading || selected !== target || linkOrigin !== target) return;
     if (!byPubkey.get(target)) return; // node not on the map yet — wait
     openTarget = '';
     fitToLinks(target);
@@ -901,6 +1045,7 @@
     });
     map.on('click', 'nodes', (e) => {
       const pk = e.features[0].properties.pubkey;
+      openWithLinks(pk);
       onselect(byPubkey.get(pk) ?? e.features[0].properties);
     });
     // Hover preview: highlight + name label + link lines for the node under the
@@ -939,12 +1084,33 @@
       if (nearbyNodes.length) return;
 
       const pk = e.features[0].properties.neighbor;
+      if (pk) openWithLinks(pk);
       onselect(byPubkey.get(pk) ?? null);
     });
+    map.on('mousemove', (e) => {
+      if (!map.getLayer('area-hit')) return;
+      scheduleAreaHover(e.point);
+    });
+    // Cursor left the map entirely (moved off the canvas / out of the page):
+    // drop every kind of hover so nothing stays stuck highlighted. The
+    // layer-specific mouseleave handlers don't always fire when the pointer
+    // exits the window quickly, so clear node, link and area hover here too.
+    map.on('mouseout', () => {
+      onHoverNode('');
+      onhoverlink('');
+      if (hoverAreaId) setHoverArea('');
+    });
     map.on('click', (e) => {
-      // A click that hits neither a node, a cluster, nor a link line deselects.
+      // A click that hits neither a node, a cluster, a link line, nor a pickable
+      // parent territory deselects.
       const hits = map.queryRenderedFeatures(e.point, { layers: ['nodes', 'clusters', 'node-links'] });
-      if (!hits.length) onselect(null);
+      if (hits.length) return;
+      const areaId = pickedAreaId(e.point);
+      if (areaId) {
+        onselectnetwork(areaId);
+        return;
+      }
+      onselect(null);
     });
   }
 
@@ -1027,6 +1193,7 @@
   });
 
   onDestroy(() => {
+    cancelAnimationFrame(areaHoverFrame);
     stopHoverPreview();
     map?.remove();
   });
@@ -1056,10 +1223,13 @@
     hoverPk;
     emphasizedNet;
     emphasizedAreaIds;
+    areaPickIds;
+    areaRanks;
     if (!ready) return;
-    // Selection, hover and an opened network all frame coverage, so load area
-    // data on demand even when the persistent coverage toggle is off.
+    // Territory hover/click needs the transparent area-hit layer even when the
+    // persistent coverage toggle is off, so load the area data once the map is ready.
     const want =
+      areaPickIds.length > 0 ||
       showAreas ||
       selectedNetworks().length > 0 ||
       hoveredNetworks().length > 0 ||
@@ -1070,7 +1240,7 @@
       // Zoom to an opened network once, when it becomes emphasised.
       if (emphasizedNet && emphasizedNet !== lastEmphFit && areasData) {
         lastEmphFit = emphasizedNet;
-        fitToNetwork(emphasizedNet);
+        focusNetwork(emphasizedNet);
       } else if (!emphasizedNet) {
         lastEmphFit = '';
       }
@@ -1141,6 +1311,7 @@
   // clears `links` on deselect, so this also clears the source).
   $effect(() => {
     links;
+    linksFor;
     selected;
     if (ready) buildLinkFeatures();
   });
@@ -1150,6 +1321,7 @@
   $effect(() => {
     selected;
     links;
+    linksFor;
     linksLoading;
     emphasizedNet;
     networkMemberIds;
