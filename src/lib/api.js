@@ -1,101 +1,110 @@
-// Client for the MeshCore Ninja map API. Every viewport request is keyed and
-// briefly cached, and the caller threads an AbortSignal so a new request cancels
-// the previous in-flight one (see MapView's moveend handler).
+// Client for the MeshCore Ninja API.
 
 export const API_BASE = (import.meta.env?.VITE_API_BASE || 'https://api.meshcore.ninja').replace(
   /\/+$/,
   ''
 );
 
-const CACHE_TTL_MS = 30_000;
-const cache = new Map(); // normalized query string -> { at, data }
+// --- snapshot-based full-node load -------------------------------------------
+// The API publishes a versioned full-map snapshot every 5 minutes.  latest.json
+// points to the current snapshot URL; the snapshot itself is served with a
+// one-year immutable cache so browsers only download it once per publish cycle.
+//
+// Compact tuple layout (one per node):
+//   [pubkey, name, nodeType, lat, lon, lastAdvertAt, advertCount, networks[]]
+// advertCount === 0 marks imported (map.meshcore.io) directory nodes that carry
+// no network membership; live nodes always have advertCount >= 1.
 
-/**
- * Build the /api/map query string from filter state. Only non-default params are
- * emitted so cache keys stay stable and URLs short.
- * @param {object} p
- * @param {[number,number,number,number]} [p.bbox] west,south,east,north
- * @param {number} p.zoom
- * @param {number[]} [p.types]
- * @param {string} [p.net]
- * @param {string} [p.active] one of 24h|7d|30d|all
- * @param {string} [p.q]
- */
-export function mapQueryString({ bbox, zoom, types, net, active, q }) {
-  const sp = new URLSearchParams();
-  sp.set('zoom', String(zoom));
-  // Search is global, so the bbox is irrelevant (and omitting it keeps the cache
-  // key from churning as the user pans around a search result).
-  if (bbox && !q) sp.set('bbox', bbox.map((n) => n.toFixed(4)).join(','));
-  if (types?.length) sp.set('types', [...types].sort().join(','));
-  if (net) sp.set('networks', net);
-  if (active && active !== 'all') sp.set('active', active);
-  if (q) sp.set('q', q);
-  return sp.toString();
+const NODE_TYPE_NAMES = { 1: 'chat', 2: 'repeater', 3: 'room', 4: 'sensor' };
+
+function tupleToFeature([pubkey, name, type, lat, lon, lastAdvertAt, advertCount, networks]) {
+  return {
+    type: 'Feature',
+    geometry: { type: 'Point', coordinates: [lon, lat] },
+    properties: {
+      cluster: false,
+      pubkey,
+      name,
+      type,
+      typeName: NODE_TYPE_NAMES[type] ?? 'unknown',
+      lastAdvertAt,
+      advertCount,
+      networks: Array.isArray(networks) ? networks : [],
+      imported: advertCount === 0
+    }
+  };
+}
+
+// Memoised promise for the current snapshot's feature array. Invalidated when a
+// newer snapshot URL is detected (latest.json poll interval is 30 s server-side).
+let cachedSnapshotURL = '';
+let snapshotPromise = null;
+
+async function loadSnapshot() {
+  const manifestRes = await fetch(`${API_BASE}/api/snapshots/latest.json`);
+  if (!manifestRes.ok) throw new Error(`snapshot manifest ${manifestRes.status}`);
+  const manifest = await manifestRes.json();
+  const url = manifest.url;
+
+  // Re-use the in-flight/resolved promise as long as the snapshot URL hasn't
+  // changed.  A new publish invalidates the cache so the map picks up fresh
+  // nodes on the next allNodes() call (triggered by a page reload or a future
+  // auto-refresh).
+  if (url === cachedSnapshotURL && snapshotPromise) return snapshotPromise;
+
+  cachedSnapshotURL = url;
+  snapshotPromise = (async () => {
+    // The browser automatically decompresses the zstd body (Chrome 123+,
+    // Firefox 126+, Safari 17.4+) and applies the immutable cache entry.
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`snapshot ${res.status}`);
+    const payload = await res.json();
+    return (payload.nodes ?? []).map(tupleToFeature);
+  })();
+  return snapshotPromise;
 }
 
 /**
- * Fetch one viewport as a GeoJSON FeatureCollection. Fresh cached responses are
- * returned without a network round-trip.
- * @param {object} params see mapQueryString
- * @param {AbortSignal} [signal]
- */
-export async function mapQuery(params, signal) {
-  const qs = mapQueryString(params);
-  const hit = cache.get(qs);
-  if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.data;
-
-  const res = await fetch(`${API_BASE}/api/map?${qs}`, { signal });
-  if (!res.ok) throw new Error(`map api ${res.status}`);
-  const data = await res.json();
-  cache.set(qs, { at: Date.now(), data });
-  return data;
-}
-
-let allNodesPromise;
-/**
- * Every GPS node, once, as a GeoJSON FeatureCollection. Loaded a single time and
- * memoized — the map clusters and filters this set entirely client-side, so no
- * further node requests are made as the user pans, zooms or filters.
+ * Every GPS node as a GeoJSON FeatureCollection, loaded from the versioned
+ * snapshot and memoised for the page lifetime.  Filters and clustering are
+ * applied entirely client-side so no further node requests are made as the
+ * user pans, zooms or changes filters.
  * @returns {Promise<{type:string,features:any[]}>}
  */
-export function allNodes() {
-  if (!allNodesPromise) {
-    allNodesPromise = fetch(`${API_BASE}/api/map?all=1`).then((r) => {
-      if (!r.ok) throw new Error(`map api ${r.status}`);
-      return r.json();
-    });
-  }
-  return allNodesPromise;
+export async function allNodes() {
+  const features = await loadSnapshot();
+  return { type: 'FeatureCollection', features };
 }
 
 /**
- * Individual nodes within a bounding box, as a GeoJSON FeatureCollection. Used
- * for the first paint: the current viewport loads fast, then {@link allNodes}
- * backfills the rest of the world. Not memoized (the bbox varies).
+ * GPS nodes within a bounding box, derived from the same snapshot as
+ * {@link allNodes}.  Used for the first paint: the viewport subset is ready as
+ * soon as the snapshot arrives; {@link allNodes} reuses the same promise so the
+ * "replace viewport with world" step is a no-op after the first call.
  * @param {[number,number,number,number]} bbox west,south,east,north
- * @param {AbortSignal} [signal]
  * @returns {Promise<{type:string,features:any[]}>}
  */
-export function viewportNodes(bbox, signal) {
-  const qs = `all=1&bbox=${bbox.map((n) => n.toFixed(4)).join(',')}`;
-  return fetch(`${API_BASE}/api/map?${qs}`, { signal }).then((r) => {
-    if (!r.ok) throw new Error(`map api ${r.status}`);
-    return r.json();
-  });
+export async function viewportNodes(bbox) {
+  const features = await loadSnapshot();
+  const [west, south, east, north] = bbox;
+  return {
+    type: 'FeatureCollection',
+    features: features.filter(({ geometry: { coordinates: [lon, lat] } }) =>
+      lon >= west && lon <= east && lat >= south && lat <= north
+    )
+  };
 }
 
+// --- links, route, live feed, areas, networks --------------------------------
+
 /**
- * Observed links for one node, as already-aggregated link records. Only links
- * with this node as an endpoint are returned — never the global topology. The
- * caller passes an AbortSignal so selecting another node cancels this request.
- * @param {string} pubkey selected node's public key (hex)
+ * Observed links for one node.
+ * @param {string} pubkey
  * @param {object} [opts]
- * @param {string} [opts.net] restrict to links observed through this network
- * @param {string} [opts.active] one of 24h|7d|30d (omit/`all` = no recency filter)
+ * @param {string} [opts.net]
+ * @param {string} [opts.active]
  * @param {number} [opts.limit]
  * @param {AbortSignal} [signal]
- * @returns {Promise<{node:string,links:any[],returned:number,total:number,capped:boolean}>}
  */
 export function nodeLinks(pubkey, { net, active, limit } = {}, signal) {
   const sp = new URLSearchParams();
@@ -111,17 +120,13 @@ export function nodeLinks(pubkey, { net, active, limit } = {}, signal) {
 }
 
 /**
- * Best-effort route between two nodes over the observed-link graph. The backend
- * runs a reliability-weighted shortest path (recent, busy links preferred) and
- * returns the ordered node path plus per-hop link stats, so the panel can explain
- * the route and the map can draw it without further requests.
- * @param {string} from origin node pubkey (hex)
- * @param {string} to destination node pubkey (hex)
+ * Best-effort route between two nodes over the observed-link graph.
+ * @param {string} from
+ * @param {string} to
  * @param {object} [opts]
- * @param {string} [opts.net] restrict the graph to links observed through this network
- * @param {string} [opts.active] one of 24h|7d|30d (omit/`all` = no recency filter)
+ * @param {string} [opts.net]
+ * @param {string} [opts.active]
  * @param {AbortSignal} [signal]
- * @returns {Promise<{from:string,to:string,found:boolean,nodes:any[],hops:any[]}>}
  */
 export function routeQuery(from, to, { net, active } = {}, signal) {
   const sp = new URLSearchParams({ from, to });
@@ -135,17 +140,12 @@ export function routeQuery(from, to, { net, active } = {}, signal) {
 }
 
 /**
- * Subscribe to the live advert feed over a WebSocket. Every advert the backend
- * observes is pushed as a compact frame ({@link LiveAdvert} on the server) and
- * handed to `onAdvert`. The socket reconnects on its own with capped backoff, so
- * a dropped connection silently recovers.
- *
- * Returns a disposer that closes the socket and stops reconnecting.
- *
- * @param {(advert:object)=>void} onAdvert called once per advert frame
+ * Subscribe to the live advert feed over a WebSocket.  Reconnects with capped
+ * backoff.  Returns a disposer that closes the socket and stops reconnecting.
+ * @param {(advert:object)=>void} onAdvert
  * @param {object} [opts]
- * @param {(open:boolean)=>void} [opts.onStatus] connection up/down notifications
- * @returns {() => void} stop the subscription
+ * @param {(open:boolean)=>void} [opts.onStatus]
+ * @returns {()=>void}
  */
 export function liveAdverts(onAdvert, { onStatus } = {}) {
   if (typeof WebSocket === 'undefined') return () => {};
@@ -159,7 +159,7 @@ export function liveAdverts(onAdvert, { onStatus } = {}) {
     if (closed) return;
     ws = new WebSocket(url);
     ws.onopen = () => {
-      backoff = 1000; // reset once a connection succeeds
+      backoff = 1000;
       onStatus?.(true);
     };
     ws.onmessage = (ev) => {
@@ -177,7 +177,6 @@ export function liveAdverts(onAdvert, { onStatus } = {}) {
       retryTimer = setTimeout(connect, backoff);
       backoff = Math.min(backoff * 2, 15000);
     };
-    // An error is always followed by a close, where the retry is scheduled.
     ws.onerror = () => ws.close();
   };
 
@@ -189,14 +188,12 @@ export function liveAdverts(onAdvert, { onStatus } = {}) {
   };
 }
 
-// Network coverage polygons come from the main catalog's prebuilt combined file
-// (one request, tagged per network). Overridable for local testing.
 const AREAS_ORIGIN = (import.meta.env?.VITE_AREAS_ORIGIN || 'https://meshcore.ninja').replace(
   /\/+$/,
   ''
 );
 let areasPromise;
-/** The combined network-area FeatureCollection (memoized). */
+/** The combined network-area FeatureCollection (memoised). */
 export function networkAreas() {
   if (!areasPromise) {
     areasPromise = fetch(`${AREAS_ORIGIN}/network-area/all.geojson`)
@@ -208,8 +205,8 @@ export function networkAreas() {
 
 let networksPromise;
 /**
- * The network list (id + name), used to label the network filter. Fetched once
- * and memoized; failures resolve to an empty list so the filter just hides.
+ * The network list (id + name), used to label the network filter.  Fetched
+ * once and memoised; failures resolve to an empty list.
  * @returns {Promise<{id:string,name:string}[]>}
  */
 export function networks() {
