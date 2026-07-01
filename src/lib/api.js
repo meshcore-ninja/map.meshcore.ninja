@@ -44,7 +44,10 @@ async function loadSnapshot() {
   const manifestRes = await fetch(`${API_BASE}/api/snapshots/latest.json`);
   if (!manifestRes.ok) throw new Error(`snapshot manifest ${manifestRes.status}`);
   const manifest = await manifestRes.json();
-  const url = manifest.url;
+  // Resolve relative URLs (no origin configured on the server) against the API base.
+  const url = manifest.url.startsWith('/')
+    ? `${API_BASE}${manifest.url}`
+    : manifest.url;
 
   // Re-use the in-flight/resolved promise as long as the snapshot URL hasn't
   // changed.  A new publish invalidates the cache so the map picks up fresh
