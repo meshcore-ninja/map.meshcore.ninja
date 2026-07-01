@@ -704,16 +704,16 @@
 </header>
 
 {#if hoveredAreaNet}
-  <div class="pointer-events-none absolute left-1/2 top-3 z-20 hidden -translate-x-1/2 sm:block">
-    <div class="map-float flex max-w-[28rem] items-center gap-2 rounded-xl border border-accent2/40 bg-elev/90 px-3 py-2 text-[0.82rem] backdrop-blur">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-4 w-4 shrink-0 text-accent2" aria-hidden="true">
+  <div class="pointer-events-none absolute left-1/2 top-4 z-20 hidden -translate-x-1/2 sm:block">
+    <div class="map-float flex max-w-[32rem] items-center gap-3 rounded-full border border-accent2/50 bg-elev/95 px-5 py-2.5 shadow-lg shadow-black/30 backdrop-blur">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-5 w-5 shrink-0 text-accent2" aria-hidden="true">
         <circle cx="12" cy="12" r="9" /><path d="M12 3a15 15 0 0 1 0 18M3 12h18" stroke-linecap="round" />
       </svg>
-      <span class="min-w-0 truncate font-medium text-ink">{hoveredAreaNet.short_name || hoveredAreaNet.name || hoveredAreaNet.id}</span>
+      <span class="min-w-0 truncate text-[0.95rem] font-semibold tracking-tight text-ink">{hoveredAreaNet.short_name || hoveredAreaNet.name || hoveredAreaNet.id}</span>
       {#if (hoveredAreaNet.coverage?.countries ?? []).length}
         <span class="flex shrink-0 items-center gap-1">
           {#each hoveredAreaNet.coverage.countries.slice(0, 3) as cc}
-            <Flag code={cc} class="h-3 w-4 rounded-sm opacity-80" />
+            <Flag code={cc} class="h-3.5 w-5 rounded-sm opacity-90" />
           {/each}
         </span>
       {/if}

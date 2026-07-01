@@ -863,14 +863,15 @@
   let featuresVersion = $state(0);
 
   // Open a node and, once its links have loaded, zoom so the node and every
-  // drawable link neighbour are in view (see the openTarget effect below). Pan
-  // to the node right away (keeping the current zoom) for immediate feedback;
-  // the link fit then adjusts the zoom, avoiding a zoom-in-then-out jump.
+  // drawable link neighbour are in view (see the openTarget effect below). Only
+  // pan to the node right away (keeping the *current* zoom) for immediate
+  // feedback — the single link-fit that follows is the only zoom change, so the
+  // camera never zooms in and then straight back out.
   export function openWithLinks(pk) {
     openTarget = pk;
     const f = byPubkey.get(pk);
     if (map && f && Number.isFinite(f.lon) && Number.isFinite(f.lat)) {
-      map.flyTo({ center: [f.lon, f.lat], zoom: Math.max(map.getZoom(), 12), duration: 600 });
+      map.easeTo({ center: [f.lon, f.lat], duration: 400 });
     }
   }
 
